@@ -20,6 +20,15 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# Silence noisy HTTP request logs from python-telegram-bot's HTTP stack.
+# (PTB v20+ uses httpx/httpcore internally.)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Silence most telegram library logs (keep warnings/errors).
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 # Global model and config
 model = None
 config = None
@@ -270,7 +279,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Initialize game
         game = KingCapture()
         mcts = MCTS(model, num_simulations=400, c_puct=config.c_puct, 
-                   device=device, batch_size=config.mcts_batch_size)
+                   device=device)
         
         games[chat_id] = {
             'game': game,
@@ -341,21 +350,41 @@ async def make_ai_move(query, chat_id):
     
     # AI thinking...
     policy = mcts.search(game)
-    
-    # Choose best move
+
+    # Choose an AI move by sampling from the MCTS policy (less deterministic than argmax).
+    # This avoids "always the same moves" when multiple actions are plausible.
+    PLAY_TEMPERATURE = 0.8  # 1.0 = sample as-is, <1 sharper, >1 flatter, 0.0 = greedy
+    PLAY_EPSILON = 0.05     # mix in a bit of uniform over valid moves for variety
+
     valid_moves = game.get_valid_moves()
-    best_move = None
-    best_prob = -1
-    
-    for piece_idx, row, col in valid_moves:
-        action = game.move_to_action(piece_idx, row, col)
-        prob = policy[action]
-        if prob > best_prob:
-            best_prob = prob
-            best_move = (piece_idx, row, col)
-            
-    if best_move:
-        game.make_move(*best_move)
+    valid_actions = [game.move_to_action(piece_idx, row, col) for piece_idx, row, col in valid_moves]
+
+    action = None
+    if valid_actions:
+        probs = policy[valid_actions].astype(np.float64)
+
+        # Robust renormalization in case policy is slightly off / degenerate.
+        probs_sum = float(probs.sum())
+        if probs_sum <= 0.0 or not np.isfinite(probs_sum):
+            probs = np.ones(len(valid_actions), dtype=np.float64) / float(len(valid_actions))
+        else:
+            probs = probs / probs_sum
+
+        # Add a bit of uniform exploration.
+        if PLAY_EPSILON > 0:
+            probs = (1.0 - PLAY_EPSILON) * probs + PLAY_EPSILON * (1.0 / float(len(valid_actions)))
+
+        # Temperature: sample from probs^(1/T). If T==0, fall back to greedy.
+        if PLAY_TEMPERATURE and PLAY_TEMPERATURE > 0:
+            probs = probs ** (1.0 / float(PLAY_TEMPERATURE))
+            probs = probs / float(probs.sum())
+            action = int(np.random.choice(valid_actions, p=probs))
+        else:
+            action = int(valid_actions[int(np.argmax(probs))])
+
+    if action is not None:
+        piece_idx, row, col = game.action_to_move(action)
+        game.make_move(piece_idx, row, col)
         
     if game.game_over:
         await handle_game_over(query, game, user_plays_white)

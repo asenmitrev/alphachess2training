@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 
 
 def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int, 
-                     c_puct: float, temperature: float, device: str, mcts_batch_size: int = 64,
+                     c_puct: float, temperature: float, device: str,
                      max_game_length: int = 400) -> List[Tuple]:
     """
-    Run a batch of games using batched MCTS.
+    Run a batch of games using sequential MCTS.
     This function is used by both the main process and worker processes.
     """
-    # Initialize MCTS with batch size
-    mcts = MCTS(model, num_simulations, c_puct, device, batch_size=mcts_batch_size)
+    # Initialize MCTS
+    mcts = MCTS(model, num_simulations, c_puct, device)
     
     examples = []
     
@@ -73,7 +73,14 @@ def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int,
             
             # Store history
             state = game.get_canonical_state()
-            game_histories[game_idx].append((state, policy))
+            
+            # Flip policy to canonical view if Black
+            # MCTS returns policy in real board coordinates, but we train on canonical coordinates
+            store_policy = policy
+            if game.current_player == Player.BLACK:
+                store_policy = game.flip_policy(policy)
+            
+            game_histories[game_idx].append((state, store_policy))
             
             # Apply move
             piece_idx, row, col = game.action_to_move(action)
@@ -154,8 +161,7 @@ def worker_self_play_queue(rank: int, model_state: Dict, config: Dict, work_queu
     model.eval()
     
     # Initialize MCTS
-    mcts = MCTS(model, config['num_simulations'], config['c_puct'], device, 
-                batch_size=config.get('mcts_batch_size', 64))
+    mcts = MCTS(model, config['num_simulations'], config['c_puct'], device)
     
     all_examples = []
     games_processed = 0
@@ -249,7 +255,13 @@ def _run_single_game(model: AlphaZeroNet, mcts: MCTS, num_simulations: int,
         
         # Store history
         state = game.get_canonical_state()
-        game_history.append((state, policy))
+        
+        # Flip policy to canonical view if Black
+        store_policy = policy
+        if game.current_player == Player.BLACK:
+            store_policy = game.flip_policy(policy)
+        
+        game_history.append((state, store_policy))
         
         # Apply move
         piece_idx, row, col = game.action_to_move(action)
@@ -326,7 +338,6 @@ def worker_self_play(rank: int, model_state: Dict, config: Dict, num_games: int)
         c_puct=config['c_puct'],
         temperature=config['temperature'],
         device=device,
-        mcts_batch_size=config.get('mcts_batch_size', 64),
         max_game_length=config.get('max_game_length', 400)
     )
 
@@ -380,8 +391,7 @@ class AlphaZeroTrainer:
         temperature: float = 1.0,
         device: str = 'cpu',
         save_dir: str = 'checkpoints',
-        num_workers: int = 0,
-        mcts_batch_size: int = 64  # Add this parameter
+        num_workers: int = 0
     ):
         """
         Initialize trainer.
@@ -411,7 +421,6 @@ class AlphaZeroTrainer:
         self.device = device
         self.save_dir = save_dir
         self.num_workers = num_workers if num_workers > 0 else 1
-        self.mcts_batch_size = mcts_batch_size
         self.max_game_length = 400  # Default, can be overridden
         
         # Create save directory
@@ -424,7 +433,7 @@ class AlphaZeroTrainer:
         self.initial_params = {name: param.data.clone() for name, param in self.model.named_parameters()}
         
         # Initialize MCTS (for single-process use if needed)
-        self.mcts = MCTS(self.model, num_simulations, c_puct, device, batch_size=mcts_batch_size)
+        self.mcts = MCTS(self.model, num_simulations, c_puct, device)
         
         # Initialize replay buffer
         self.replay_buffer = ReplayBuffer()
@@ -465,7 +474,7 @@ class AlphaZeroTrainer:
             # Single process
             examples = run_batched_games(
                 self.model, self.num_games, self.num_simulations, 
-                self.c_puct, self.temperature, self.device, self.mcts_batch_size,
+                self.c_puct, self.temperature, self.device,
                 max_game_length=getattr(self, 'max_game_length', 400)
             )
         else:
@@ -491,7 +500,6 @@ class AlphaZeroTrainer:
                 'c_puct': self.c_puct,
                 'temperature': self.temperature,
                 'device': self.device,
-                'mcts_batch_size': self.mcts_batch_size,
                 'max_game_length': getattr(self, 'max_game_length', 400)
             }
             

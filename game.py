@@ -410,12 +410,11 @@ class KingCapture:
                 # Black king reached bottom (white's starting row)
                 self.game_over = True
                 self.winner = Player.BLACK
-            else:
-                # True king moved but didn't reach end row - switch player
-                self.current_player = Player.BLACK if self.current_player == Player.WHITE else Player.WHITE
-        else:
-            # Kinglike moved - switch player
-            self.current_player = Player.BLACK if self.current_player == Player.WHITE else Player.WHITE
+
+        # IMPORTANT: Always advance turn after a move, even if the game ended.
+        # MCTS/backprop assumes `current_player` is the side-to-move at this state.
+        # `winner` captures the side that won the terminal move.
+        self.current_player = Player.BLACK if self.current_player == Player.WHITE else Player.WHITE
         
         return True
     
@@ -451,6 +450,9 @@ class KingCapture:
         - Opponent's true king = -1.0
         - Opponent's kinglike = -0.5
         - Empty = 0.0
+        
+        Also flips the board spatially if current player is BLACK,
+        so that current player always plays from bottom (rows increasing).
         """
         state = self.get_state().astype(np.float32)
         
@@ -460,6 +462,8 @@ class KingCapture:
                    np.where(state == Piece.BLACK_KINGLIKE.value, 0.5,
                    np.where(state == Piece.WHITE_KING.value, -1.0,
                    np.where(state == Piece.WHITE_KINGLIKE.value, -0.5, 0.0))))
+            # Flip spatially: row 0 becomes row 4
+            state = np.flip(state, axis=0).copy()
         else:  # WHITE
             # White is positive, black is negative
             state = np.where(state == Piece.WHITE_KING.value, 1.0,
@@ -468,6 +472,27 @@ class KingCapture:
                    np.where(state == Piece.BLACK_KINGLIKE.value, -0.5, 0.0))))
         
         return state
+    
+    def flip_policy(self, policy: np.ndarray) -> np.ndarray:
+        """
+        Flip the policy spatially (rows 0<->4, 1<->3).
+        Used to convert network output (canonical view) back to real board actions,
+        or vice versa.
+        """
+        flipped_policy = np.zeros_like(policy)
+        
+        # Action space: 2 pieces * 25 positions
+        for piece_idx in range(2):
+            for row in range(self.BOARD_SIZE):
+                for col in range(self.BOARD_SIZE):
+                    action = piece_idx * self.BOARD_SIZE * self.BOARD_SIZE + row * self.BOARD_SIZE + col
+                    flipped_row = self.BOARD_SIZE - 1 - row
+                    flipped_action = piece_idx * self.BOARD_SIZE * self.BOARD_SIZE + flipped_row * self.BOARD_SIZE + col
+                    
+                    flipped_policy[flipped_action] = policy[action]
+                    
+        return flipped_policy
+
     
     def get_action_mask(self) -> np.ndarray:
         """

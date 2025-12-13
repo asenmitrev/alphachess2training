@@ -47,8 +47,7 @@ def main():
         c_puct=config.c_puct,
         temperature=config.temperature,
         device=str(device),
-        save_dir=config.save_dir,
-        mcts_batch_size=config.mcts_batch_size
+        save_dir=config.save_dir
     )
     
     # Set max game length from config
