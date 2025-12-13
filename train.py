@@ -11,7 +11,7 @@ import random
 from typing import List, Tuple, Dict, Any
 from game import KingCapture, Player
 from model import AlphaZeroNet
-from mcts import MCTS, BatchedMCTS, ParallelGameRunner
+from mcts import MCTS, ParallelMCTSRunner
 import os
 import time
 import logging
@@ -465,29 +465,33 @@ class AlphaZeroTrainer:
     
     def self_play(self) -> List[Tuple]:
         """
-        Generate self-play games using batched MCTS for efficient GPU utilization.
+        Generate self-play games using parallel workers + centralized GPU inference.
         
-        All games are run in parallel within a single process, with neural network
-        calls batched together for maximum GPU throughput.
+        Architecture:
+        - One inference server process owns the GPU and batches requests
+        - Multiple worker processes run MCTS trees on CPU in parallel
+        - Workers send states to evaluate, server batches and returns results
         """
-        print(f"Generating {self.num_games} games with batched MCTS (mcts_batch_size={self.mcts_batch_size})...")
+        print(f"Generating {self.num_games} games with {self.num_workers} workers "
+              f"(batch_size={self.mcts_batch_size})...")
         start_time = time.time()
         
-        # Use ParallelGameRunner for efficient batched game generation
-        runner = ParallelGameRunner(
+        # Use ParallelMCTSRunner with inference server architecture
+        runner = ParallelMCTSRunner(
             model=self.model,
             num_simulations=self.num_simulations,
             c_puct=self.c_puct,
             temperature=self.temperature,
             device=self.device,
-            batch_size=self.mcts_batch_size
+            num_workers=self.num_workers,
+            batch_size=self.mcts_batch_size,
+            batch_timeout=0.002  # 2ms to collect batches
         )
         
-        # Run all games with batched MCTS
+        # Run all games with parallel workers
         examples = runner.run_games(
             num_games=self.num_games,
-            max_game_length=getattr(self, 'max_game_length', 400),
-            log_interval=max(1, self.num_games // 20)  # Log ~20 times during generation
+            max_game_length=getattr(self, 'max_game_length', 400)
         )
         
         elapsed = time.time() - start_time

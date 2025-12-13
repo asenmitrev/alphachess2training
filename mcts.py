@@ -1,12 +1,15 @@
 """
 Monte Carlo Tree Search implementation for AlphaZero.
-Includes both sequential and batched MCTS for efficient GPU utilization.
+Includes both sequential MCTS and parallel MCTS with centralized inference server.
 """
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from typing import List, Tuple, Optional, Dict
 from game import KingCapture, Player
 import math
+import queue
+import time
 
 
 class Node:
@@ -29,9 +32,6 @@ class Node:
         self.visit_count = 0
         self.value_sum = 0.0
         self.prior = 0.0  # Prior probability from neural network
-        
-        # For batched MCTS: track if this node is pending evaluation
-        self.pending_evaluation = False
     
     def is_expanded(self) -> bool:
         """Check if node has been expanded."""
@@ -51,24 +51,15 @@ class Node:
             c_puct: Exploration constant
         """
         best_score = float('-inf')
-        best_action = None
         best_child = None
         
         for action, child in self.children.items():
             # PUCT formula: Q + U
-            #
-            # IMPORTANT SIGN NOTE:
-            # - `child.get_value()` is from the *child node's* `current_player` perspective.
-            # - At the parent, the player-to-move is the opponent of the child.
-            # Therefore, from the *parent* perspective, Q(s,a) = -V(child).
-            #
-            # U = c_puct * P * sqrt(N_parent) / (1 + N_child)
             u = c_puct * child.prior * math.sqrt(self.visit_count) / (1 + child.visit_count)
             score = (-child.get_value()) + u
             
             if score > best_score:
                 best_score = score
-                best_action = action
                 best_child = child
         
         return best_child
@@ -96,32 +87,19 @@ class Node:
         
         Args:
             value: Value to propagate (from current player's perspective)
-                  1.0 for win, -1.0 for loss, 0.0 for draw
         """
-        # Add real value
         self.value_sum += value
         self.visit_count += 1
         
         if self.parent is not None:
-            # Value is from current player's perspective
-            # For parent (opponent), negate the value (zero-sum game)
             self.parent.backpropagate(-value)
 
 
 class MCTS:
-    """Monte Carlo Tree Search for AlphaZero."""
+    """Monte Carlo Tree Search for AlphaZero (sequential version)."""
     
     def __init__(self, model: torch.nn.Module, num_simulations: int = 100, c_puct: float = 1.0, 
                  device: str = 'cpu'):
-        """
-        Initialize MCTS.
-        
-        Args:
-            model: Neural network model
-            num_simulations: Number of MCTS simulations per move
-            c_puct: Exploration constant
-            device: Device to run model on
-        """
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
@@ -129,62 +107,44 @@ class MCTS:
         self.model.eval()
     
     def search(self, game: KingCapture) -> np.ndarray:
-        """
-        Perform MCTS search and return improved policy.
-        
-        Args:
-            game: Current game state
-        
-        Returns:
-            Policy distribution over actions
-        """
+        """Perform MCTS search and return improved policy."""
         root = Node(game)
         
-        # Get initial policy from neural network
         with torch.no_grad():
             state = self._game_to_tensor(game)
             policy_logits, value = self.model(state)
             policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
             
-            # If playing as Black, flip policy from canonical view to real board view
             if game.current_player == Player.BLACK:
                 policy = game.flip_policy(policy)
             
-            # Mask invalid actions
             action_mask = game.get_action_mask()
             policy = policy * action_mask
-            policy = policy / (policy.sum() + 1e-8)  # Renormalize
+            policy = policy / (policy.sum() + 1e-8)
         
         root.expand(policy)
         
-        # Sequential MCTS simulations
         for sim in range(self.num_simulations):
             node = root
             
-            # Selection: traverse to leaf
             while node.is_expanded() and not node.game.game_over:
                 node = node.select_child(self.c_puct)
             
-            # Check if terminal
             if node.game.game_over:
                 result = node.game.get_result(node.game.current_player)
                 value = result if result is not None else 0.0
                 node.backpropagate(value)
             else:
-                # Evaluate and expand this leaf node
                 self._evaluate(node)
         
-        # Extract visit counts as policy
         action_size = 2 * game.BOARD_SIZE * game.BOARD_SIZE
         visit_counts = np.zeros(action_size)
         for action, child in root.children.items():
             visit_counts[action] = child.visit_count
         
-        # Normalize to get policy distribution
         if visit_counts.sum() > 0:
             policy = visit_counts / visit_counts.sum()
         else:
-            # Fallback to uniform over valid moves
             action_mask = game.get_action_mask()
             policy = action_mask.astype(float)
             policy = policy / policy.sum()
@@ -192,38 +152,21 @@ class MCTS:
         return policy
     
     def search_batch(self, games: List[KingCapture]) -> List[np.ndarray]:
-        """
-        Perform MCTS search on multiple games sequentially.
-        
-        Args:
-            games: List of game states to search
-            
-        Returns:
-            List of policy distributions, one per game
-        """
+        """Perform MCTS search on multiple games sequentially."""
         return [self.search(game) for game in games]
     
     def _evaluate(self, node: Node):
-        """
-        Evaluate a single node using the neural network.
-        
-        Args:
-            node: Node to evaluate
-        """
-        # Convert to tensor
+        """Evaluate a single node using the neural network."""
         tensor = self._game_to_tensor(node.game)
         
-        # Evaluate
         with torch.no_grad():
             policy_logits, values = self.model(tensor)
             policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
             value = values.item()
         
-        # Flip policy if Black
         if node.game.current_player == Player.BLACK:
             policy = node.game.flip_policy(policy)
         
-        # Mask invalid actions
         action_mask = node.game.get_action_mask()
         policy = policy * action_mask
         policy = policy / (policy.sum() + 1e-8)
@@ -234,339 +177,434 @@ class MCTS:
     def _game_to_tensor(self, game: KingCapture) -> torch.Tensor:
         """Convert game state to tensor for neural network."""
         state = game.get_canonical_state()
-        # Add batch and channel dimensions: (1, 1, board_size, board_size)
         tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
         return tensor.to(self.device)
 
 
-class BatchedMCTS:
+# ============================================================================
+# Inference Server Architecture for Parallel MCTS
+# ============================================================================
+
+def inference_server(model_state: Dict, config: Dict, request_queue: mp.Queue, 
+                     response_queues: Dict[int, mp.Queue], shutdown_event: mp.Event):
     """
-    Batched Monte Carlo Tree Search for efficient GPU utilization.
+    Centralized inference server that batches GPU requests from all workers.
     
-    This implementation runs MCTS for multiple games simultaneously,
-    collecting all leaf nodes that need neural network evaluation and
-    processing them in a single batched GPU call.
+    This process owns the GPU and batches evaluation requests from workers
+    for maximum throughput.
+    
+    Args:
+        model_state: State dict of the neural network
+        config: Configuration dict with model params
+        request_queue: Queue to receive evaluation requests from workers
+        response_queues: Dict mapping worker_id -> response queue
+        shutdown_event: Event to signal shutdown
     """
+    import logging
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
     
-    def __init__(self, model: torch.nn.Module, num_simulations: int = 100, 
-                 c_puct: float = 1.0, device: str = 'cpu', batch_size: int = 256):
-        """
-        Initialize Batched MCTS.
-        
-        Args:
-            model: Neural network model
-            num_simulations: Number of MCTS simulations per move
-            c_puct: Exploration constant
-            device: Device to run model on
-            batch_size: Maximum batch size for neural network evaluation
-        """
-        self.model = model
-        self.num_simulations = num_simulations
-        self.c_puct = c_puct
-        self.device = device
-        self.batch_size = batch_size
-        self.model.eval()
+    # Reconstruct model on GPU
+    from model import AlphaZeroNet
+    device = config['device']
+    model = AlphaZeroNet(
+        board_size=config['board_size'],
+        num_channels=config['num_channels'],
+        num_residual_blocks=config['num_residual_blocks']
+    )
+    model.load_state_dict(model_state)
+    model.to(device)
+    model.eval()
     
-    def search_batch(self, games: List[KingCapture]) -> List[np.ndarray]:
-        """
-        Perform MCTS search on multiple games with batched neural network evaluation.
-        
-        This is the main entry point for efficient parallel game generation.
-        All games are processed together, and neural network calls are batched.
-        
-        Args:
-            games: List of game states to search
+    batch_size = config.get('batch_size', 256)
+    batch_timeout = config.get('batch_timeout', 0.001)  # 1ms timeout to collect batch
+    
+    logging.info(f"Inference server started on {device}, batch_size={batch_size}")
+    
+    pending_requests = []
+    
+    while not shutdown_event.is_set():
+        # Collect requests into a batch
+        try:
+            # Wait for first request with timeout
+            request = request_queue.get(timeout=0.1)
+            pending_requests.append(request)
             
-        Returns:
-            List of policy distributions, one per game
-        """
-        if not games:
-            return []
-        
-        num_games = len(games)
-        
-        # Initialize roots for all games
-        roots = [Node(game.copy()) for game in games]
-        
-        # First, expand all roots with batched neural network evaluation
-        self._batch_expand_roots(roots, games)
-        
-        # Run simulations with batched evaluation
-        for sim in range(self.num_simulations):
-            # For each game, traverse to a leaf node
-            leaves_to_evaluate = []
-            terminal_nodes = []
+            # Collect more requests up to batch_size or timeout
+            batch_start = time.time()
+            while len(pending_requests) < batch_size:
+                try:
+                    elapsed = time.time() - batch_start
+                    remaining_timeout = max(0.0001, batch_timeout - elapsed)
+                    request = request_queue.get(timeout=remaining_timeout)
+                    pending_requests.append(request)
+                except queue.Empty:
+                    break
             
-            for game_idx, root in enumerate(roots):
-                node = root
-                
-                # Selection: traverse to leaf
-                while node.is_expanded() and not node.game.game_over:
-                    node = node.select_child(self.c_puct)
-                
-                # Check if terminal
-                if node.game.game_over:
-                    terminal_nodes.append((game_idx, node))
-                else:
-                    leaves_to_evaluate.append((game_idx, node))
+        except queue.Empty:
+            continue
+        
+        if not pending_requests:
+            continue
+        
+        # Process batch
+        try:
+            # Extract states and metadata
+            states = []
+            worker_ids = []
+            request_ids = []
+            is_black_list = []
             
-            # Handle terminal nodes immediately
-            for game_idx, node in terminal_nodes:
+            for req in pending_requests:
+                worker_id, request_id, state, is_black = req
+                states.append(state)
+                worker_ids.append(worker_id)
+                request_ids.append(request_id)
+                is_black_list.append(is_black)
+            
+            # Batch evaluate
+            batch_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(device)
+            
+            with torch.no_grad():
+                policy_logits, values = model(batch_tensor)
+                policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
+                values_np = values.cpu().numpy().flatten()
+            
+            # Send responses back to workers
+            for idx, (worker_id, request_id) in enumerate(zip(worker_ids, request_ids)):
+                policy = policies[idx]
+                value = float(values_np[idx])
+                response_queues[worker_id].put((request_id, policy, value))
+            
+        except Exception as e:
+            logging.error(f"Inference server error: {e}")
+            # Send error responses
+            for req in pending_requests:
+                worker_id, request_id, _, _ = req
+                # Send uniform policy and 0 value as fallback
+                policy = np.ones(50) / 50  # Uniform over action space
+                response_queues[worker_id].put((request_id, policy, 0.0))
+        
+        pending_requests = []
+    
+    logging.info("Inference server shutting down")
+
+
+def worker_process(rank: int, config: Dict, work_queue: mp.Queue, result_queue: mp.Queue,
+                   request_queue: mp.Queue, response_queue: mp.Queue, shutdown_event: mp.Event):
+    """
+    Worker process that runs MCTS games using the inference server.
+    
+    Args:
+        rank: Worker ID
+        config: Configuration dict
+        work_queue: Queue to get game IDs from
+        result_queue: Queue to send training examples to
+        request_queue: Queue to send inference requests to server
+        response_queue: Queue to receive inference responses from server
+        shutdown_event: Event to signal shutdown
+    """
+    import logging
+    import random
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+    
+    # Set random seed
+    seed = int(time.time() * 1000) % (2**32) + rank
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    num_simulations = config['num_simulations']
+    c_puct = config['c_puct']
+    temperature = config['temperature']
+    max_game_length = config.get('max_game_length', 400)
+    
+    all_examples = []
+    games_processed = 0
+    request_counter = 0
+    
+    def evaluate_state(state: np.ndarray, is_black: bool) -> Tuple[np.ndarray, float]:
+        """Send state to inference server and wait for response."""
+        nonlocal request_counter
+        request_id = request_counter
+        request_counter += 1
+        
+        request_queue.put((rank, request_id, state, is_black))
+        
+        # Wait for response
+        while True:
+            try:
+                resp_id, policy, value = response_queue.get(timeout=1.0)
+                if resp_id == request_id:
+                    return policy, value
+                # Wrong response, put it back (shouldn't happen)
+                response_queue.put((resp_id, policy, value))
+            except queue.Empty:
+                if shutdown_event.is_set():
+                    return np.ones(50) / 50, 0.0
+    
+    def run_mcts(game: KingCapture) -> np.ndarray:
+        """Run MCTS for a single position using inference server."""
+        root = Node(game.copy())
+        
+        # Get initial policy for root
+        state = game.get_canonical_state()
+        is_black = game.current_player == Player.BLACK
+        policy, _ = evaluate_state(state, is_black)
+        
+        if is_black:
+            policy = game.flip_policy(policy)
+        
+        action_mask = game.get_action_mask()
+        policy = policy * action_mask
+        policy_sum = policy.sum()
+        if policy_sum > 0:
+            policy = policy / policy_sum
+        
+        root.expand(policy)
+        
+        # Run simulations
+        for sim in range(num_simulations):
+            node = root
+            
+            # Selection
+            while node.is_expanded() and not node.game.game_over:
+                node = node.select_child(c_puct)
+            
+            # Terminal check
+            if node.game.game_over:
                 result = node.game.get_result(node.game.current_player)
                 value = result if result is not None else 0.0
                 node.backpropagate(value)
-            
-            # Batch evaluate all leaves
-            if leaves_to_evaluate:
-                self._batch_evaluate(leaves_to_evaluate)
-        
-        # Extract policies from visit counts
-        policies = []
-        action_size = 2 * games[0].BOARD_SIZE * games[0].BOARD_SIZE
-        
-        for game_idx, (root, game) in enumerate(zip(roots, games)):
-            visit_counts = np.zeros(action_size)
-            for action, child in root.children.items():
-                visit_counts[action] = child.visit_count
-            
-            # Normalize to get policy distribution
-            if visit_counts.sum() > 0:
-                policy = visit_counts / visit_counts.sum()
             else:
-                # Fallback to uniform over valid moves
-                action_mask = game.get_action_mask()
-                policy = action_mask.astype(float)
-                policy = policy / (policy.sum() + 1e-8)
-            
-            policies.append(policy)
+                # Evaluate leaf
+                state = node.game.get_canonical_state()
+                is_black = node.game.current_player == Player.BLACK
+                policy, value = evaluate_state(state, is_black)
+                
+                if is_black:
+                    policy = node.game.flip_policy(policy)
+                
+                action_mask = node.game.get_action_mask()
+                policy = policy * action_mask
+                policy_sum = policy.sum()
+                if policy_sum > 0:
+                    policy = policy / policy_sum
+                
+                node.expand(policy)
+                node.backpropagate(value)
         
-        return policies
-    
-    def _batch_expand_roots(self, roots: List[Node], games: List[KingCapture]):
-        """
-        Expand root nodes with a batched neural network call.
+        # Extract policy from visit counts
+        action_size = 2 * game.BOARD_SIZE * game.BOARD_SIZE
+        visit_counts = np.zeros(action_size)
+        for action, child in root.children.items():
+            visit_counts[action] = child.visit_count
         
-        Args:
-            roots: List of root nodes to expand
-            games: Original game states (for reference)
-        """
-        if not roots:
-            return
-        
-        # Prepare batch of states
-        states = []
-        for root in roots:
-            state = root.game.get_canonical_state()
-            states.append(state)
-        
-        # Stack into batch tensor
-        batch_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(self.device)
-        
-        # Batch evaluate
-        with torch.no_grad():
-            policy_logits, values = self.model(batch_tensor)
-            policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
-        
-        # Expand each root with its policy
-        for idx, (root, game) in enumerate(zip(roots, games)):
-            policy = policies[idx]
-            
-            # Flip policy if Black
-            if game.current_player == Player.BLACK:
-                policy = game.flip_policy(policy)
-            
-            # Mask invalid actions
+        if visit_counts.sum() > 0:
+            return visit_counts / visit_counts.sum()
+        else:
             action_mask = game.get_action_mask()
-            policy = policy * action_mask
-            policy = policy / (policy.sum() + 1e-8)
-            
-            root.expand(policy)
+            return action_mask.astype(float) / action_mask.sum()
     
-    def _batch_evaluate(self, leaves: List[Tuple[int, Node]]):
-        """
-        Batch evaluate multiple leaf nodes and expand/backpropagate them.
+    # Main loop: pull games from queue
+    while not shutdown_event.is_set():
+        try:
+            game_id = work_queue.get(timeout=0.1)
+        except queue.Empty:
+            break
         
-        Args:
-            leaves: List of (game_idx, node) tuples to evaluate
-        """
-        if not leaves:
-            return
-        
-        # Prepare batch of states
-        states = []
-        for game_idx, node in leaves:
-            state = node.game.get_canonical_state()
-            states.append(state)
-        
-        # Stack into batch tensor
-        batch_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(self.device)
-        
-        # Batch evaluate
-        with torch.no_grad():
-            policy_logits, values = self.model(batch_tensor)
-            policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
-            values_np = values.cpu().numpy().flatten()
-        
-        # Expand and backpropagate each node
-        for idx, (game_idx, node) in enumerate(leaves):
-            policy = policies[idx]
-            value = float(values_np[idx])
+        try:
+            # Play one game
+            game = KingCapture()
+            game_history = []
             
-            # Flip policy if Black
-            if node.game.current_player == Player.BLACK:
-                policy = node.game.flip_policy(policy)
+            while not game.game_over:
+                if len(game.move_history) >= max_game_length:
+                    game.game_over = True
+                    game.winner = None
+                    break
+                
+                # Run MCTS
+                policy = run_mcts(game)
+                
+                # Select action
+                valid_moves = game.get_valid_moves()
+                valid_actions = [game.move_to_action(p, r, c) for p, r, c in valid_moves]
+                
+                if temperature > 0:
+                    valid_policy = policy[valid_actions]
+                    valid_policy = valid_policy ** (1.0 / temperature)
+                    valid_policy = valid_policy / (valid_policy.sum() + 1e-8)
+                    action = np.random.choice(valid_actions, p=valid_policy)
+                else:
+                    action = valid_actions[np.argmax(policy[valid_actions])]
+                
+                # Store history
+                state = game.get_canonical_state()
+                store_policy = policy
+                if game.current_player == Player.BLACK:
+                    store_policy = game.flip_policy(policy)
+                
+                game_history.append((state, store_policy))
+                
+                # Make move
+                piece_idx, row, col = game.action_to_move(action)
+                game.make_move(piece_idx, row, col)
             
-            # Mask invalid actions
-            action_mask = node.game.get_action_mask()
-            policy = policy * action_mask
-            policy_sum = policy.sum()
-            if policy_sum > 0:
-                policy = policy / policy_sum
+            # Process result
+            max_moves_reached = len(game.move_history) >= max_game_length
+            result = game.get_result(Player.WHITE)
+            if max_moves_reached:
+                result = -1.0
+            elif result is None:
+                result = 0.0
             
-            node.expand(policy)
-            node.backpropagate(value)
+            # Create training examples
+            for i, (hist_state, hist_policy) in enumerate(game_history):
+                if max_moves_reached:
+                    value = -1.0
+                else:
+                    value = result if i % 2 == 0 else -result
+                all_examples.append((hist_state, hist_policy, value))
+            
+            games_processed += 1
+            
+            if games_processed % 10 == 0:
+                winner = game.winner.name if game.winner else "Draw"
+                logging.info(f"Worker {rank}: {games_processed} games done (last: {winner} in {len(game.move_history)} moves)")
+            
+            work_queue.task_done()
+            
+        except Exception as e:
+            logging.error(f"Worker {rank} error: {e}")
+            work_queue.task_done()
+    
+    # Send results
+    result_queue.put((rank, all_examples))
+    logging.info(f"Worker {rank} finished: {games_processed} games, {len(all_examples)} examples")
 
 
-class ParallelGameRunner:
+class ParallelMCTSRunner:
     """
-    Runs multiple games in parallel with batched MCTS.
+    Manages parallel MCTS game generation with a centralized inference server.
     
-    This is the main class for efficient game generation.
-    It manages multiple games simultaneously and uses batched
-    neural network evaluation for maximum GPU throughput.
+    Architecture:
+    - One inference server process owns the GPU and batches requests
+    - Multiple worker processes run MCTS trees on CPU
+    - Workers send states to evaluate, server batches and returns results
+    
+    This maximizes GPU utilization while allowing parallel tree traversal.
     """
     
     def __init__(self, model: torch.nn.Module, num_simulations: int = 100,
                  c_puct: float = 1.0, temperature: float = 1.0,
-                 device: str = 'cpu', batch_size: int = 256):
+                 device: str = 'cuda', num_workers: int = 4,
+                 batch_size: int = 256, batch_timeout: float = 0.001):
         """
-        Initialize the parallel game runner.
+        Initialize the parallel MCTS runner.
         
         Args:
             model: Neural network model
             num_simulations: MCTS simulations per move
             c_puct: MCTS exploration constant
             temperature: Action selection temperature
-            device: Device for neural network
-            batch_size: Batch size for neural network calls
+            device: Device for neural network (should be 'cuda')
+            num_workers: Number of parallel worker processes
+            batch_size: Maximum batch size for inference server
+            batch_timeout: How long to wait to collect a batch (seconds)
         """
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.temperature = temperature
         self.device = device
+        self.num_workers = max(1, num_workers)
         self.batch_size = batch_size
-        self.mcts = BatchedMCTS(model, num_simulations, c_puct, device, batch_size)
+        self.batch_timeout = batch_timeout
     
-    def run_games(self, num_games: int, max_game_length: int = 400,
-                  log_interval: int = 10) -> List[Tuple]:
+    def run_games(self, num_games: int, max_game_length: int = 400) -> List[Tuple]:
         """
-        Run multiple games in parallel and return training examples.
+        Run multiple games in parallel using inference server architecture.
         
         Args:
-            num_games: Number of games to run
+            num_games: Number of games to generate
             max_game_length: Maximum moves per game
-            log_interval: How often to log progress
             
         Returns:
             List of (state, policy, value) training examples
         """
         import logging
         
-        # Initialize all games
-        games = [KingCapture() for _ in range(num_games)]
-        game_histories = [[] for _ in range(num_games)]
-        active_indices = list(range(num_games))
+        ctx = mp.get_context('spawn')
         
-        examples = []
-        move_count = 0
+        # Create queues
+        work_queue = ctx.JoinableQueue()
+        result_queue = ctx.Queue()
+        request_queue = ctx.Queue()
+        response_queues = {i: ctx.Queue() for i in range(self.num_workers)}
+        shutdown_event = ctx.Event()
         
-        # Play until all games are finished
-        while active_indices:
-            move_count += 1
-            
-            # Get current games
-            current_games = [games[i] for i in active_indices]
-            
-            # Batched MCTS search for all active games
-            policies = self.mcts.search_batch(current_games)
-            
-            # Process each game
-            finished_indices = []
-            
-            for idx_in_batch, policy in enumerate(policies):
-                game_idx = active_indices[idx_in_batch]
-                game = games[game_idx]
-                
-                # Select action
-                valid_moves = game.get_valid_moves()
-                valid_actions = [game.move_to_action(piece_idx, r, c) 
-                               for piece_idx, r, c in valid_moves]
-                
-                if self.temperature > 0:
-                    # Sample with temperature
-                    valid_policy = policy[valid_actions]
-                    valid_policy = valid_policy ** (1.0 / self.temperature)
-                    valid_policy = valid_policy / (valid_policy.sum() + 1e-8)
-                    action = np.random.choice(valid_actions, p=valid_policy)
-                else:
-                    # Greedy
-                    action = valid_actions[np.argmax(policy[valid_actions])]
-                
-                # Store history
-                state = game.get_canonical_state()
-                
-                # Flip policy to canonical view if Black
-                store_policy = policy
-                if game.current_player == Player.BLACK:
-                    store_policy = game.flip_policy(policy)
-                
-                game_histories[game_idx].append((state, store_policy))
-                
-                # Apply move
-                piece_idx, row, col = game.action_to_move(action)
-                game.make_move(piece_idx, row, col)
-                
-                # Check move limit
-                max_moves_reached = False
-                if len(game.move_history) >= max_game_length:
-                    game.game_over = True
-                    game.winner = None
-                    max_moves_reached = True
-                
-                if game.game_over:
-                    finished_indices.append(idx_in_batch)
-                    
-                    # Process result
-                    result = game.get_result(Player.WHITE)
-                    if max_moves_reached:
-                        result = -1.0
-                    elif result is None:
-                        result = 0.0
-                    
-                    # Log completion
-                    num_moves = len(game.move_history)
-                    winner = game.winner.name if game.winner else "Draw"
-                    remaining = len(active_indices) - len(finished_indices)
-                    
-                    if (num_games - remaining) % log_interval == 0 or remaining == 0:
-                        logging.info(f"Games completed: {num_games - remaining}/{num_games} "
-                                   f"(last: {winner} in {num_moves} moves)")
-                    
-                    # Store training examples
-                    for i, (hist_state, hist_policy) in enumerate(game_histories[game_idx]):
-                        if max_moves_reached:
-                            value = -1.0
-                        else:
-                            if i % 2 == 0:
-                                value = result
-                            else:
-                                value = -result
-                        
-                        examples.append((hist_state, hist_policy, value))
-            
-            # Remove finished games
-            for idx_in_batch in sorted(finished_indices, reverse=True):
-                active_indices.pop(idx_in_batch)
+        # Put all games into work queue
+        for game_id in range(num_games):
+            work_queue.put(game_id)
         
-        return examples
+        # Config for workers
+        config = {
+            'board_size': self.model.board_size,
+            'num_channels': self.model.num_channels,
+            'num_residual_blocks': self.model.num_residual_blocks,
+            'num_simulations': self.num_simulations,
+            'c_puct': self.c_puct,
+            'temperature': self.temperature,
+            'device': self.device,
+            'max_game_length': max_game_length,
+            'batch_size': self.batch_size,
+            'batch_timeout': self.batch_timeout,
+        }
+        
+        model_state = self.model.state_dict()
+        
+        # Start inference server
+        server_process = ctx.Process(
+            target=inference_server,
+            args=(model_state, config, request_queue, response_queues, shutdown_event)
+        )
+        server_process.start()
+        
+        # Give server time to initialize
+        time.sleep(0.5)
+        
+        # Start workers
+        workers = []
+        for rank in range(self.num_workers):
+            p = ctx.Process(
+                target=worker_process,
+                args=(rank, config, work_queue, result_queue, 
+                      request_queue, response_queues[rank], shutdown_event)
+            )
+            p.start()
+            workers.append(p)
+        
+        # Collect results
+        all_examples = []
+        for _ in range(self.num_workers):
+            rank, examples = result_queue.get()
+            all_examples.extend(examples)
+            logging.info(f"Collected {len(examples)} examples from worker {rank}")
+        
+        # Shutdown
+        shutdown_event.set()
+        
+        for p in workers:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+        
+        server_process.join(timeout=5)
+        if server_process.is_alive():
+            server_process.terminate()
+        
+        return all_examples
+
+
+# Backward compatibility alias
+BatchedMCTS = MCTS
+ParallelGameRunner = ParallelMCTSRunner
