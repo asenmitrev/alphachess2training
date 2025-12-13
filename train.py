@@ -11,7 +11,7 @@ import random
 from typing import List, Tuple, Dict, Any
 from game import KingCapture, Player
 from model import AlphaZeroNet
-from mcts import MCTS
+from mcts import MCTS, BatchedMCTS, ParallelGameRunner
 import os
 import time
 import logging
@@ -391,7 +391,8 @@ class AlphaZeroTrainer:
         temperature: float = 1.0,
         device: str = 'cpu',
         save_dir: str = 'checkpoints',
-        num_workers: int = 0
+        num_workers: int = 0,
+        mcts_batch_size: int = 256
     ):
         """
         Initialize trainer.
@@ -408,7 +409,8 @@ class AlphaZeroTrainer:
             temperature: Temperature for action selection (1.0 = full exploration, 0.0 = greedy)
             device: Device to run on
             save_dir: Directory to save checkpoints
-            num_workers: Number of parallel workers for self-play
+            num_workers: Number of parallel workers for self-play (deprecated, using batched MCTS)
+            mcts_batch_size: Batch size for MCTS neural network evaluations
         """
         self.model = model.to(device)
         self.num_simulations = num_simulations
@@ -416,6 +418,7 @@ class AlphaZeroTrainer:
         self.num_iterations = num_iterations
         self.num_epochs = num_epochs
         self.batch_size = batch_size
+        self.mcts_batch_size = mcts_batch_size
         self.c_puct = c_puct
         self.temperature = temperature
         self.device = device
@@ -462,77 +465,35 @@ class AlphaZeroTrainer:
     
     def self_play(self) -> List[Tuple]:
         """
-        Generate self-play games using multiprocessing with work-stealing queue.
-        Workers dynamically pull games from a shared queue, allowing fast workers
-        to pick up remaining games from slow workers.
+        Generate self-play games using batched MCTS for efficient GPU utilization.
+        
+        All games are run in parallel within a single process, with neural network
+        calls batched together for maximum GPU throughput.
         """
-        examples = []
-        print(f"Generating {self.num_games} games using {self.num_workers} workers with work-stealing...")
+        print(f"Generating {self.num_games} games with batched MCTS (mcts_batch_size={self.mcts_batch_size})...")
         start_time = time.time()
         
-        if self.num_workers <= 1:
-            # Single process
-            examples = run_batched_games(
-                self.model, self.num_games, self.num_simulations, 
-                self.c_puct, self.temperature, self.device,
-                max_game_length=getattr(self, 'max_game_length', 400)
-            )
-        else:
-            # Multiprocessing with work-stealing queue
-            # We need to use 'spawn' for CUDA support
-            ctx = mp.get_context('spawn')
-            
-            # Create shared queues for work distribution
-            manager = ctx.Manager()
-            work_queue = manager.Queue()
-            result_queue = manager.Queue()
-            
-            # Put all games into the work queue
-            for game_id in range(self.num_games):
-                work_queue.put(game_id)
-            
-            # Config dict needed to reconstruct model in worker
-            worker_config = {
-                'board_size': self.model.board_size,
-                'num_channels': self.model.num_channels,
-                'num_residual_blocks': self.model.num_residual_blocks,
-                'num_simulations': self.num_simulations,
-                'c_puct': self.c_puct,
-                'temperature': self.temperature,
-                'device': self.device,
-                'max_game_length': getattr(self, 'max_game_length', 400)
-            }
-            
-            # Get current model state
-            model_state = self.model.state_dict()
-            
-            # Launch workers
-            processes = []
-            for rank in range(self.num_workers):
-                p = ctx.Process(
-                    target=worker_self_play_queue,
-                    args=(rank, model_state, worker_config, work_queue, result_queue)
-                )
-                p.start()
-                processes.append(p)
-            
-            # Collect results from all workers
-            worker_results = {}
-            for _ in range(self.num_workers):
-                rank, worker_examples = result_queue.get()
-                worker_results[rank] = worker_examples
-            
-            # Wait for all processes to finish
-            for p in processes:
-                p.join()
-            
-            # Combine all examples
-            for rank in sorted(worker_results.keys()):
-                examples.extend(worker_results[rank])
-                    
+        # Use ParallelGameRunner for efficient batched game generation
+        runner = ParallelGameRunner(
+            model=self.model,
+            num_simulations=self.num_simulations,
+            c_puct=self.c_puct,
+            temperature=self.temperature,
+            device=self.device,
+            batch_size=self.mcts_batch_size
+        )
+        
+        # Run all games with batched MCTS
+        examples = runner.run_games(
+            num_games=self.num_games,
+            max_game_length=getattr(self, 'max_game_length', 400),
+            log_interval=max(1, self.num_games // 20)  # Log ~20 times during generation
+        )
+        
         elapsed = time.time() - start_time
         print(f"Generated {self.num_games} games in {elapsed:.2f}s "
-              f"({self.num_games/elapsed:.1f} games/sec)")
+              f"({self.num_games/elapsed:.1f} games/sec, "
+              f"{len(examples)} training examples)")
         
         return examples
     

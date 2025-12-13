@@ -47,14 +47,12 @@ def main():
         c_puct=config.c_puct,
         temperature=config.temperature,
         device=str(device),
-        save_dir=config.save_dir
+        save_dir=config.save_dir,
+        mcts_batch_size=config.mcts_batch_size
     )
     
     # Set max game length from config
     trainer.max_game_length = config.max_game_length
-    
-    # Remove this line since batch_size is now set in __init__
-    # trainer.mcts.batch_size = config.mcts_batch_size
     
     # Update replay buffer size
     from train import ReplayBuffer
