@@ -7,6 +7,14 @@ from typing import List, Tuple, Optional
 from game import KingCapture, Player
 import math
 
+# Try to import Go MCTS wrapper
+try:
+    import mcts_go
+    GO_MCTS_AVAILABLE = mcts_go._lib is not None
+except (ImportError, AttributeError, RuntimeError):
+    GO_MCTS_AVAILABLE = False
+    mcts_go = None
+
 
 class Node:
     """Node in the MCTS tree."""
@@ -108,7 +116,7 @@ class MCTS:
     """Monte Carlo Tree Search for AlphaZero."""
     
     def __init__(self, model: torch.nn.Module, num_simulations: int = 100, c_puct: float = 1.0, 
-                 device: str = 'cpu'):
+                 device: str = 'cpu', use_go_mcts: bool = True):
         """
         Initialize MCTS.
         
@@ -117,12 +125,38 @@ class MCTS:
             num_simulations: Number of MCTS simulations per move
             c_puct: Exploration constant
             device: Device to run model on
+            use_go_mcts: If True and Go MCTS is available, use Go implementation (default: True)
         """
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.device = device
         self.model.eval()
+        self.use_go_mcts = use_go_mcts and GO_MCTS_AVAILABLE
+        
+        # Initialize Go MCTS if available and enabled
+        if self.use_go_mcts:
+            # Create evaluation function wrapper
+            def eval_fn(canonical_state: np.ndarray) -> Tuple[np.ndarray, float]:
+                """Evaluate state using neural network."""
+                # Add batch and channel dimensions: (1, 1, board_size, board_size)
+                tensor = torch.FloatTensor(canonical_state).unsqueeze(0).unsqueeze(0)
+                tensor = tensor.to(self.device)
+                
+                with torch.no_grad():
+                    policy_logits, value = self.model(tensor)
+                    policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
+                    val = value.item()
+                
+                return policy, val
+            
+            self.go_mcts = mcts_go.GoMCTS(
+                eval_fn=eval_fn,
+                num_simulations=num_simulations,
+                c_puct=c_puct,
+            )
+        else:
+            self.go_mcts = None
     
     def search(self, game: KingCapture) -> np.ndarray:
         """
@@ -134,6 +168,23 @@ class MCTS:
         Returns:
             Policy distribution over actions
         """
+        # Use Go MCTS if available and enabled
+        if self.use_go_mcts:
+            try:
+                # Convert game state to numpy array
+                state = game.get_state()
+                current_player_go = 1 if game.current_player == Player.WHITE else 2
+                
+                # Perform search using Go MCTS
+                policy = self.go_mcts.search(state, current_player_go)
+                
+                return policy
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Go MCTS search failed: {e}. Falling back to Python MCTS.")
+                # Fall through to Python implementation
+        
+        # Python MCTS implementation
         root = Node(game)
         
         # Get initial policy from neural network

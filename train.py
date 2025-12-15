@@ -626,26 +626,12 @@ class AlphaZeroTrainer:
                 policy_probs = torch.softmax(policy_logits, dim=1)
                 policy_loss = -torch.sum(policies_tensor * torch.log(policy_probs + 1e-8), dim=1).mean()
                 
-                # Value loss: MSE between predicted and actual value
-                # Check if value_pred requires grad (should be True)
-                if epoch == 0 and batch_idx == 0:
-                    print(f"  DEBUG - Value pred requires_grad: {value_pred.requires_grad}")
-                    print(f"  DEBUG - Value pred range: [{value_pred.min().item():.4f}, {value_pred.max().item():.4f}], mean: {value_pred.mean().item():.4f}")
-                    print(f"  DEBUG - Value target range: [{values_tensor.min().item():.4f}, {values_tensor.max().item():.4f}], mean: {values_tensor.mean().item():.4f}")
-                    print(f"  DEBUG - Value pred sample values: {value_pred[:5].squeeze().tolist()}")
-                    print(f"  DEBUG - Value target sample values: {values_tensor[:5].squeeze().tolist()}")
-                
                 value_loss = nn.functional.mse_loss(value_pred, values_tensor)
                 
                 # Debug: Print value statistics for first batch of first epoch
                 if epoch == 0 and batch_idx == 0:
                     # Compute manual MSE to verify
                     manual_mse = ((value_pred - values_tensor) ** 2).mean()
-                    print(f"  DEBUG - Value loss (F.mse_loss): {value_loss.item():.10f}")
-                    print(f"  DEBUG - Value loss (manual): {manual_mse.item():.10f}")
-                    print(f"  DEBUG - Value loss requires_grad: {value_loss.requires_grad}")
-                    print(f"  DEBUG - Differences: {(value_pred - values_tensor)[:5].squeeze().tolist()}")
-                    print(f"  DEBUG - Squared differences: {((value_pred - values_tensor) ** 2)[:5].squeeze().tolist()}")
                 
                 # Scale value loss to be comparable to policy loss (value_loss is typically much smaller)
                 value_loss_scaled = value_loss * 10.0
@@ -655,8 +641,6 @@ class AlphaZeroTrainer:
                 if epoch == 0 and batch_idx == 0:
                     # Get a sample parameter to check gradients
                     sample_param = list(self.model.parameters())[0]
-                    print(f"  DEBUG - Sample param before backward: mean={sample_param.data.mean().item():.6f}, std={sample_param.data.std().item():.6f}")
-                    print(f"  DEBUG - Sample param grad before backward: {sample_param.grad is None}")
                 
                 # Backward pass
                 total_loss.backward()
@@ -664,10 +648,6 @@ class AlphaZeroTrainer:
                 # Debug: Check gradients after backward
                 if epoch == 0 and batch_idx == 0:
                     sample_param = list(self.model.parameters())[0]
-                    if sample_param.grad is not None:
-                        print(f"  DEBUG - Sample param grad after backward: mean={sample_param.grad.mean().item():.6f}, std={sample_param.grad.std().item():.6f}, max={sample_param.grad.abs().max().item():.6f}")
-                    else:
-                        print(f"  DEBUG - WARNING: Sample param grad is None after backward!")
                 
                 # Clip gradients to prevent explosion
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -677,7 +657,6 @@ class AlphaZeroTrainer:
                 # Debug: Check if parameters changed
                 if epoch == 0 and batch_idx == 0:
                     sample_param = list(self.model.parameters())[0]
-                    print(f"  DEBUG - Sample param after step: mean={sample_param.data.mean().item():.6f}, std={sample_param.data.std().item():.6f}")
                 
                 epoch_policy_loss += policy_loss.item()
                 epoch_value_loss += value_loss.item()

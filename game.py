@@ -10,7 +10,6 @@ Performance optimizations:
 """
 import numpy as np
 import requests
-import logging
 from typing import List, Tuple, Optional, Dict, Any
 from enum import Enum
 import game_engine
@@ -27,7 +26,6 @@ except (ImportError, AttributeError, RuntimeError):
     GO_ENGINE_AVAILABLE = False
     game_engine_go = None
 
-logger = logging.getLogger(__name__)
 
 
 class Piece(Enum):
@@ -124,8 +122,6 @@ class KingCapture:
             
             # Log stats periodically
             if current_time - cls._last_log_time >= cls._log_interval:
-                calls_per_second = current_count / elapsed if elapsed > 0 else 0
-                logger.info(f"make_move calls: {current_count} total, {calls_per_second:.2f} calls/sec")
                 cls._last_log_time = current_time
     
     @classmethod
@@ -800,8 +796,8 @@ class KingCapture:
             try:
                 return self._make_move_via_go_engine(piece_idx, row, col)
             except Exception as e:
-                logger.warning(f"Go engine move failed: {e}. Falling back to Python engine.")
                 # Fall through to Python engine
+                pass
         
         # Use Python engine
         try:
@@ -836,7 +832,6 @@ class KingCapture:
             
         except Exception as e:
             # If engine fails, fall back to local implementation
-            logger.warning(f"Engine move failed: {e}. Falling back to local implementation.")
             return self._make_move_local(piece_idx, row, col)
     
     def _make_move_via_go_engine(self, piece_idx: int, row: int, col: int) -> bool:
@@ -977,20 +972,16 @@ class KingCapture:
         if captured_king:
             self.game_over = True
             self.winner = self.current_player
-            winner_name = "White" if self.winner == Player.WHITE else "Black"
-            logger.info(f"GAME OVER: {winner_name} wins by capturing opponent's king. Moves: {len(self.move_history)}")
         # 2. True king reached end row
         elif piece_idx == 0:  # Moving true king
             if self.current_player == Player.WHITE and row == 0:
                 # White king reached top (black's starting row)
                 self.game_over = True
                 self.winner = Player.WHITE
-                logger.info(f"GAME OVER: White wins - king reached end row (row 0). Moves: {len(self.move_history)}")
             elif self.current_player == Player.BLACK and row == 4:
                 # Black king reached bottom (white's starting row)
                 self.game_over = True
                 self.winner = Player.BLACK
-                logger.info(f"GAME OVER: Black wins - king reached end row (row 4). Moves: {len(self.move_history)}")
 
         # IMPORTANT: Always advance turn after a move, even if the game ended.
         # MCTS/backprop assumes `current_player` is the side-to-move at this state.
@@ -1041,8 +1032,7 @@ class KingCapture:
                 current_player_go = 1 if self.current_player == Player.WHITE else 2
                 return game_engine_go.get_canonical_state(self.board.copy(), current_player_go)
             except Exception as e:
-                logger.warning(f"Go engine get_canonical_state failed: {e}. Falling back to Python implementation.")
-        
+                pass
         # Fallback to original implementation
         state = self.get_state().astype(np.float32)
         
@@ -1096,7 +1086,7 @@ class KingCapture:
                 current_player_go = 1 if self.current_player == Player.WHITE else 2
                 return game_engine_go.get_valid_moves(self.board.copy(), current_player_go)
             except Exception as e:
-                logger.warning(f"Go engine get_action_mask failed: {e}. Falling back to Python implementation.")
+                pass
         
         # Fallback to original implementation
         mask = np.zeros(2 * self.BOARD_SIZE * self.BOARD_SIZE, dtype=bool)
