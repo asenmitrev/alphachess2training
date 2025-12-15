@@ -22,7 +22,7 @@ class Config:
     
     # Training settings
     num_iterations: int = 1000
-    num_games: int = 200  # More games per iteration
+    num_games: int = 100  # More games per iteration
     num_epochs: int = 10  # Single pass to prevent overfitting
     batch_size: int = 1024  # Large batch size for GPU utilization (increased to use more VRAM)
     learning_rate: float = 0.001
