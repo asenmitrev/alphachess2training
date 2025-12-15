@@ -18,6 +18,15 @@ import time
 import threading
 from multiprocessing import Value
 
+# Try to import Go engine wrapper
+try:
+    import game_engine_go
+    # Check if library is actually loaded
+    GO_ENGINE_AVAILABLE = game_engine_go._lib is not None
+except (ImportError, AttributeError, RuntimeError):
+    GO_ENGINE_AVAILABLE = False
+    game_engine_go = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +51,7 @@ class KingCapture:
     BOARD_SIZE = 5
     SERVER_URL = "http://localhost:8085/gameTester"
     USE_SERVER = True  # Set to True to use Python engine, False to use local implementation
+    USE_GO_ENGINE = True  # Set to True to use Go engine (fastest), False to use Python engine
     
     # Shared HTTP session for connection pooling (one per process)
     _http_session = None
@@ -775,7 +785,7 @@ class KingCapture:
     
     def _make_move_via_server(self, piece_idx: int, row: int, col: int) -> bool:
         """
-        Make a move by calling the Python game engine.
+        Make a move by calling the game engine (Go or Python).
         
         Args:
             piece_idx: 0 for true king, 1 for kinglike
@@ -785,6 +795,15 @@ class KingCapture:
         Returns:
             True if move was successful, False otherwise
         """
+        # Try Go engine first if available and enabled
+        if self.USE_GO_ENGINE and GO_ENGINE_AVAILABLE:
+            try:
+                return self._make_move_via_go_engine(piece_idx, row, col)
+            except Exception as e:
+                logger.warning(f"Go engine move failed: {e}. Falling back to Python engine.")
+                # Fall through to Python engine
+        
+        # Use Python engine
         try:
             # Convert state to engine format
             engine_state = self._to_engine_state(piece_idx, row, col)
@@ -819,6 +838,73 @@ class KingCapture:
             # If engine fails, fall back to local implementation
             logger.warning(f"Engine move failed: {e}. Falling back to local implementation.")
             return self._make_move_local(piece_idx, row, col)
+    
+    def _make_move_via_go_engine(self, piece_idx: int, row: int, col: int) -> bool:
+        """
+        Make a move using the Go game engine (tensor-based, fastest).
+        
+        Args:
+            piece_idx: 0 for true king, 1 for kinglike
+            row: Destination row
+            col: Destination column
+        
+        Returns:
+            True if move was successful, False otherwise
+        """
+        # Convert current player to Go format (1=WHITE, 2=BLACK)
+        current_player_go = 1 if self.current_player == Player.WHITE else 2
+        
+        # Get current board state
+        state = self.board.copy()
+        
+        # Call Go engine
+        new_state, game_over, winner, success = game_engine_go.make_move(
+            state,
+            current_player_go,
+            piece_idx,
+            row,
+            col
+        )
+        
+        if not success:
+            return False
+        
+        # Update board state
+        self.board = new_state
+        
+        # Update piece positions from new board state
+        self.white_king_pos = None
+        self.white_kinglike_pos = None
+        self.black_king_pos = None
+        self.black_kinglike_pos = None
+        
+        for i in range(self.BOARD_SIZE):
+            for j in range(self.BOARD_SIZE):
+                piece_val = self.board[i, j]
+                if piece_val == Piece.WHITE_KING.value:
+                    self.white_king_pos = (i, j)
+                elif piece_val == Piece.WHITE_KINGLIKE.value:
+                    self.white_kinglike_pos = (i, j)
+                elif piece_val == Piece.BLACK_KING.value:
+                    self.black_king_pos = (i, j)
+                elif piece_val == Piece.BLACK_KINGLIKE.value:
+                    self.black_kinglike_pos = (i, j)
+        
+        # Update game state
+        if game_over:
+            self.game_over = True
+            if winner == 1:
+                self.winner = Player.WHITE
+            elif winner == 2:
+                self.winner = Player.BLACK
+        
+        # Advance turn (Go engine doesn't handle this, so we do it here)
+        self.current_player = Player.BLACK if self.current_player == Player.WHITE else Player.WHITE
+        
+        # Add move to history
+        self.move_history.append((piece_idx, row, col))
+        
+        return True
     
     def _make_move_local(self, piece_idx: int, row: int, col: int) -> bool:
         """
@@ -949,6 +1035,15 @@ class KingCapture:
         Also flips the board spatially if current player is BLACK,
         so that current player always plays from bottom (rows increasing).
         """
+        # Try Go engine first if available and enabled
+        if self.USE_GO_ENGINE and GO_ENGINE_AVAILABLE:
+            try:
+                current_player_go = 1 if self.current_player == Player.WHITE else 2
+                return game_engine_go.get_canonical_state(self.board.copy(), current_player_go)
+            except Exception as e:
+                logger.warning(f"Go engine get_canonical_state failed: {e}. Falling back to Python implementation.")
+        
+        # Fallback to original implementation
         state = self.get_state().astype(np.float32)
         
         if self.current_player == Player.BLACK:
@@ -995,7 +1090,14 @@ class KingCapture:
         Action space: 2 pieces * BOARD_SIZE * BOARD_SIZE = 2 * 25 = 50 actions
         Format: [piece0_actions, piece1_actions] flattened
         """
-
+        # Try Go engine first if available and enabled
+        if self.USE_GO_ENGINE and GO_ENGINE_AVAILABLE:
+            try:
+                current_player_go = 1 if self.current_player == Player.WHITE else 2
+                return game_engine_go.get_valid_moves(self.board.copy(), current_player_go)
+            except Exception as e:
+                logger.warning(f"Go engine get_action_mask failed: {e}. Falling back to Python implementation.")
+        
         # Fallback to original implementation
         mask = np.zeros(2 * self.BOARD_SIZE * self.BOARD_SIZE, dtype=bool)
         valid_moves = self.get_valid_moves()
