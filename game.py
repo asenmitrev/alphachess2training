@@ -14,6 +14,9 @@ import logging
 from typing import List, Tuple, Optional, Dict, Any
 from enum import Enum
 import game_engine
+import time
+import threading
+from multiprocessing import Value
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,15 @@ class KingCapture:
     
     # Shared HTTP session for connection pooling (one per process)
     _http_session = None
+    
+    # Thread-safe counters for tracking make_move calls across threads/processes
+    # Note: With multiprocessing 'spawn', each process has its own counter.
+    # Stats are aggregated per-process. For true cross-process aggregation, use a Manager.
+    _move_counter = Value('i', 0)  # Multiprocessing-safe integer counter (has built-in lock)
+    _start_time_lock = threading.Lock()  # Lock for thread-safe start_time access
+    _start_time = None  # Start time for rate calculation
+    _last_log_time = None  # Last time we logged stats
+    _log_interval = 5.0  # Log stats every 5 seconds
     
     # King move offsets (1 square in any direction)
     KING_MOVES = [
@@ -76,6 +88,72 @@ class KingCapture:
             cls._http_session.mount('http://', adapter)
             cls._http_session.mount('https://', adapter)
         return cls._http_session
+    
+    @classmethod
+    def _init_move_counter(cls):
+        """Initialize move counter start time (called once, thread-safe)."""
+        with cls._start_time_lock:
+            if cls._start_time is None:
+                cls._start_time = time.time()
+                cls._last_log_time = cls._start_time
+    
+    @classmethod
+    def _increment_move_counter(cls):
+        """Thread-safe increment of move counter."""
+        cls._init_move_counter()
+        
+        # Increment counter (multiprocessing.Value has built-in lock)
+        with cls._move_counter.get_lock():
+            cls._move_counter.value += 1
+            current_count = cls._move_counter.value
+        
+        # Check if we should log (use thread lock for time variables)
+        with cls._start_time_lock:
+            current_time = time.time()
+            elapsed = current_time - cls._start_time
+            
+            # Log stats periodically
+            if current_time - cls._last_log_time >= cls._log_interval:
+                calls_per_second = current_count / elapsed if elapsed > 0 else 0
+                logger.info(f"make_move calls: {current_count} total, {calls_per_second:.2f} calls/sec")
+                cls._last_log_time = current_time
+    
+    @classmethod
+    def get_move_stats(cls) -> Dict[str, float]:
+        """
+        Get current move statistics.
+        
+        Returns:
+            Dictionary with 'total_calls', 'calls_per_second', 'elapsed_time'
+        """
+        cls._init_move_counter()
+        
+        # Get counter value (multiprocessing.Value has built-in lock)
+        with cls._move_counter.get_lock():
+            total_calls = cls._move_counter.value
+        
+        # Get time values (thread-safe)
+        with cls._start_time_lock:
+            current_time = time.time()
+            elapsed = current_time - cls._start_time
+        
+        calls_per_second = total_calls / elapsed if elapsed > 0 else 0.0
+        
+        return {
+            'total_calls': total_calls,
+            'calls_per_second': calls_per_second,
+            'elapsed_time': elapsed
+        }
+    
+    @classmethod
+    def reset_move_counter(cls):
+        """Reset move counter (useful for testing or restarting stats)."""
+        with cls._move_counter.get_lock():
+            cls._move_counter.value = 0
+        
+        with cls._start_time_lock:
+            cls._start_time = time.time()
+            cls._last_log_time = cls._start_time
     
     def __init__(self):
         """Initialize board with pieces in starting positions."""
@@ -678,6 +756,9 @@ class KingCapture:
         Returns:
             True if move was valid, False otherwise
         """
+        # Increment thread-safe counter
+        self._increment_move_counter()
+        
         if self.game_over:
             return False
         
