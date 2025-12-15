@@ -11,8 +11,9 @@ Performance optimizations:
 import numpy as np
 import requests
 import logging
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from enum import Enum
+import game_engine
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class KingCapture:
     
     BOARD_SIZE = 5
     SERVER_URL = "http://localhost:8085/gameTester"
-    USE_SERVER = True  # Set to False to use local implementation
+    USE_SERVER = True  # Set to True to use Python engine, False to use local implementation
     
     # Shared HTTP session for connection pooling (one per process)
     _http_session = None
@@ -206,6 +207,224 @@ class KingCapture:
                 "y": int(target_row)
             }
         }
+    
+    def _to_engine_state(self, piece_idx: int, target_row: int, target_col: int) -> Dict[str, Any]:
+        """
+        Convert game state to engine format with Python callbacks.
+        
+        Args:
+            piece_idx: Index of the piece being moved (0=king, 1=kinglike)
+            target_row: Target row for the move
+            target_col: Target column for the move
+        
+        Returns:
+            Dictionary in engine-expected format with Python callbacks
+        """
+        pieces = []
+        
+        # King moves in engine format (absolute moves)
+        king_moves = [
+            {"type": "absolute", "x": 0, "y": 1},
+            {"type": "absolute", "x": 1, "y": 0},
+            {"type": "absolute", "x": 1, "y": 1},
+            {"type": "absolute", "x": -1, "y": -1},
+            {"type": "absolute", "x": 0, "y": -1},
+            {"type": "absolute", "x": -1, "y": 0},
+            {"type": "absolute", "x": -1, "y": 1},
+            {"type": "absolute", "x": 1, "y": -1}
+        ]
+        
+        # Add black king
+        if self.black_king_pos is not None:
+            black_king = {
+                "icon": "blackShroom.png",
+                "moves": king_moves.copy(),
+                "color": "black",
+                "x": int(self.black_king_pos[1]),  # col -> x
+                "y": int(self.black_king_pos[0]),  # row -> y
+            }
+            # Callback: when black king is captured, white wins
+            def black_king_taken(state):
+                state["won"] = 1  # white wins
+                return False  # Prevent the capture
+            
+            # Callback: when black king reaches end row (row 4), black wins
+            # This callback is attached to the black_king object, so we can check its position
+            def black_king_moves(state):
+                # Check if this black king (the one that moved) is at row 4
+                # The callback is called after the piece has moved, so check black_king's current position
+                if black_king.get("y") == self.BOARD_SIZE - 1:
+                    state["won"] = 2  # black wins
+            
+            black_king["afterThisPieceTaken"] = black_king_taken
+            black_king["afterThisPieceMoves"] = black_king_moves
+            pieces.append(black_king)
+        
+        # Add black kinglike
+        if self.black_kinglike_pos is not None:
+            pieces.append({
+                "icon": "blackKing.png",
+                "moves": king_moves.copy(),
+                "color": "black",
+                "x": int(self.black_kinglike_pos[1]),
+                "y": int(self.black_kinglike_pos[0])
+            })
+        
+        # Add white king
+        if self.white_king_pos is not None:
+            white_king = {
+                "icon": "whiteKing.png",
+                "moves": king_moves.copy(),
+                "color": "white",
+                "x": int(self.white_king_pos[1]),
+                "y": int(self.white_king_pos[0]),
+                "value": 2.5,
+                "posValue": 2
+            }
+            # Callback: when white king is captured, black wins
+            def white_king_taken(state):
+                state["won"] = 2  # black wins
+                return False  # Prevent the capture
+            
+            # Callback: when white king reaches end row (row 0), white wins
+            # This callback is attached to the white_king object, so we can check its position
+            def white_king_moves(state):
+                # Check if this white king (the one that moved) is at row 0
+                # The callback is called after the piece has moved, so check white_king's current position
+                if white_king.get("y") == 0:
+                    state["won"] = 1  # white wins
+            
+            white_king["afterThisPieceTaken"] = white_king_taken
+            white_king["afterThisPieceMoves"] = white_king_moves
+            pieces.append(white_king)
+        
+        # Add white kinglike
+        if self.white_kinglike_pos is not None:
+            pieces.append({
+                "icon": "whiteKing.png",
+                "moves": king_moves.copy(),
+                "color": "white",
+                "x": int(self.white_kinglike_pos[1]),
+                "y": int(self.white_kinglike_pos[0]),
+                "value": 2.5,
+                "posValue": 2
+            })
+        
+        # Create board cells
+        board = []
+        for y in range(self.BOARD_SIZE):
+            for x in range(self.BOARD_SIZE):
+                board.append({
+                    "x": x,
+                    "y": y,
+                    "allowedMove": False,
+                    "light": False
+                })
+        
+        # Get the piece being moved
+        if self.current_player == Player.WHITE:
+            piece_pos = self.white_king_pos if piece_idx == 0 else self.white_kinglike_pos
+        else:
+            piece_pos = self.black_king_pos if piece_idx == 0 else self.black_kinglike_pos
+        
+        # Find the piece object
+        piece_selected = None
+        for p in pieces:
+            if p.get("x") == int(piece_pos[1]) and p.get("y") == int(piece_pos[0]):
+                piece_selected = p
+                break
+        
+        return {
+            "pieces": pieces,
+            "board": board,
+            "turn": "white" if self.current_player == Player.WHITE else "black",
+            "pieceSelected": piece_selected,
+            "won": None
+        }
+    
+    def _from_engine_state(self, engine_state: Dict[str, Any], piece_idx: int = None, target_row: int = None, target_col: int = None) -> None:
+        """
+        Parse engine state and update game state.
+        
+        Args:
+            engine_state: Engine state dictionary
+            piece_idx: Index of piece that was moved (for piece identification)
+            target_row: Target row of the move
+            target_col: Target column of the move
+        """
+        # Store previous player and positions before updating turn
+        previous_player = self.current_player
+        
+        # Reset board
+        self.board = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
+        self.white_king_pos = None
+        self.white_kinglike_pos = None
+        self.black_king_pos = None
+        self.black_kinglike_pos = None
+        
+        # Process pieces from engine state
+        white_king_found = False
+        white_kinglike_found = False
+        black_king_found = False
+        black_kinglike_found = False
+        
+        for piece in engine_state["pieces"]:
+            x, y = piece["x"], piece["y"]
+            color = piece["color"]
+            icon = piece.get("icon", "")
+            
+            # Skip pieces that were removed (x or y is None)
+            if x is None or y is None:
+                continue
+            
+            # Identify king vs kinglike:
+            # - For black: "blackShroom.png" = king, "blackKing.png" = kinglike
+            # - For white: presence of "afterThisPieceTaken" callback = king
+            if color == "white":
+                # White king has afterThisPieceTaken callback
+                is_king = "afterThisPieceTaken" in piece
+                if is_king:
+                    if white_king_found:
+                        print(f"Warning: Multiple white kings found in engine state at ({x}, {y})")
+                    self.board[y, x] = Piece.WHITE_KING.value
+                    self.white_king_pos = (y, x)
+                    white_king_found = True
+                else:
+                    if white_kinglike_found:
+                        print(f"Warning: Multiple white kinglikes found in engine state at ({x}, {y})")
+                    self.board[y, x] = Piece.WHITE_KINGLIKE.value
+                    self.white_kinglike_pos = (y, x)
+                    white_kinglike_found = True
+            else:  # black
+                # Use icon to identify: blackShroom.png = king, blackKing.png = kinglike
+                is_king = icon == "blackShroom.png"
+                if is_king:
+                    if black_king_found:
+                        print(f"Warning: Multiple black kings found in engine state at ({x}, {y})")
+                    self.board[y, x] = Piece.BLACK_KING.value
+                    self.black_king_pos = (y, x)
+                    black_king_found = True
+                else:
+                    if black_kinglike_found:
+                        print(f"Warning: Multiple black kinglikes found in engine state at ({x}, {y})")
+                    self.board[y, x] = Piece.BLACK_KINGLIKE.value
+                    self.black_kinglike_pos = (y, x)
+                    black_kinglike_found = True
+        
+        # Update current player turn
+        if "turn" in engine_state:
+            self.current_player = Player.WHITE if engine_state["turn"] == "white" else Player.BLACK
+        else:
+            # Fallback: advance turn manually
+            self.current_player = Player.BLACK if previous_player == Player.WHITE else Player.WHITE
+        
+        # Check for game over (won field in state)
+        if "won" in engine_state and engine_state["won"] is not None:
+            self.game_over = True
+            self.winner = Player.WHITE if engine_state["won"] == 1 else Player.BLACK
+        else:
+            # Fallback: Use the old method if piece_idx is available
+            self._check_win_conditions(piece_idx, previous_player)
     
     def _check_win_conditions(self, piece_idx: int, previous_player: Player):
         """
@@ -467,7 +686,7 @@ class KingCapture:
         if (piece_idx, row, col) not in valid_moves:
             return False
         
-        # Use server if enabled
+        # Use Python engine if enabled, otherwise use local implementation
         if self.USE_SERVER:
             return self._make_move_via_server(piece_idx, row, col)
         
@@ -475,7 +694,7 @@ class KingCapture:
     
     def _make_move_via_server(self, piece_idx: int, row: int, col: int) -> bool:
         """
-        Make a move by calling the game server.
+        Make a move by calling the Python game engine.
         
         Args:
             piece_idx: 0 for true king, 1 for kinglike
@@ -486,31 +705,38 @@ class KingCapture:
             True if move was successful, False otherwise
         """
         try:
-            # Convert state to server format
-            request_data = self._state_to_server_json(piece_idx, row, col)
+            # Convert state to engine format
+            engine_state = self._to_engine_state(piece_idx, row, col)
             
-            # Make HTTP request to server using connection pooling
-            session = self._get_session()
-            response = session.post(
-                self.SERVER_URL,
-                json=request_data,
-                timeout=1.0  # Reduced timeout since we're using localhost
+            # Create playerMove dict
+            player_move = {
+                "x": int(col),  # col -> x
+                "y": int(row)   # row -> y
+            }
+            
+            # Execute move using Python engine
+            success = game_engine.playerMove(
+                player_move,
+                engine_state,
+                alwaysLight=True,  # Skip lighting check since we validate moves separately
+                selectedForced=engine_state["pieceSelected"],
+                specialFlag="allowedMove"
             )
-            response.raise_for_status()
             
-            # Parse response and update state (pass target position for piece identification)
-            server_response = response.json()
+            if not success:
+                return False
             
-            self._parse_server_response(server_response, piece_idx=piece_idx, target_row=row, target_col=col)
+            # Parse engine state back to game state
+            self._from_engine_state(engine_state, piece_idx=piece_idx, target_row=row, target_col=col)
             
             # Add move to history
             self.move_history.append((piece_idx, row, col))
             
             return True
             
-        except requests.RequestException as e:
-            # If server fails, fall back to local implementation
-            print(f"Server request failed: {e}. Falling back to local implementation.")
+        except Exception as e:
+            # If engine fails, fall back to local implementation
+            logger.warning(f"Engine move failed: {e}. Falling back to local implementation.")
             return self._make_move_local(piece_idx, row, col)
     
     def _make_move_local(self, piece_idx: int, row: int, col: int) -> bool:
