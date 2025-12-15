@@ -16,9 +16,6 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-# Import numba functions from separate module
-from game_numba import NUMBA_AVAILABLE, _get_valid_moves_numba, _get_action_mask_numba
-
 
 class Piece(Enum):
     """Piece enumeration."""
@@ -224,28 +221,24 @@ class KingCapture:
                 # White captured black king
                 self.game_over = True
                 self.winner = Player.WHITE
-                logger.info(f"GAME OVER: White wins by capturing black king. Moves: {len(self.move_history)}")
                 return
             # Check if white king reached end row (only if true king was moved)
             if piece_idx == 0 and self.white_king_pos is not None:
                 if self.white_king_pos[0] == 0:  # White king reached top row (row 0)
                     self.game_over = True
                     self.winner = Player.WHITE
-                    logger.info(f"GAME OVER: White wins - king reached end row (row 0). Moves: {len(self.move_history)}")
                     return
         else:  # BLACK
             if self.white_king_pos is None:
                 # Black captured white king
                 self.game_over = True
                 self.winner = Player.BLACK
-                logger.info(f"GAME OVER: Black wins by capturing white king. Moves: {len(self.move_history)}")
                 return
             # Check if black king reached end row (only if true king was moved)
             if piece_idx == 0 and self.black_king_pos is not None:
                 if self.black_king_pos[0] == 4:  # Black king reached bottom row (row 4)
                     self.game_over = True
                     self.winner = Player.BLACK
-                    logger.info(f"GAME OVER: Black wins - king reached end row (row 4). Moves: {len(self.move_history)}")
                     return
     
     def _parse_server_response(self, response: dict, piece_idx: int = None, target_row: int = None, target_col: int = None):
@@ -264,8 +257,6 @@ class KingCapture:
         previous_player = self.current_player
         prev_white_king_pos = self.white_king_pos
         prev_white_kinglike_pos = self.white_kinglike_pos
-        prev_black_king_pos = self.black_king_pos
-        prev_black_kinglike_pos = self.black_kinglike_pos
         
         # Reset board
         self.board = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
@@ -397,8 +388,6 @@ class KingCapture:
         if "won" in state:
             self.game_over = True
             self.winner = Player.WHITE if state["won"] == 1 else Player.BLACK
-            winner_name = "White" if self.winner == Player.WHITE else "Black"
-            logger.info(f"GAME OVER: {winner_name} wins (server reported). Moves: {len(self.move_history)}")
         else:
             # Fallback: Use the old method if piece_idx is available
             # (This handles edge cases where position-based check might miss something)
@@ -428,21 +417,6 @@ class KingCapture:
         Get list of valid moves as (piece_idx, row, col) tuples.
         piece_idx: 0 = true king, 1 = kinglike
         """
-        if NUMBA_AVAILABLE and not self.game_over:
-            # Convert positions to arrays (None -> [-1, -1])
-            white_king = np.array(self.white_king_pos if self.white_king_pos else [-1, -1], dtype=np.int32)
-            white_kinglike = np.array(self.white_kinglike_pos if self.white_kinglike_pos else [-1, -1], dtype=np.int32)
-            black_king = np.array(self.black_king_pos if self.black_king_pos else [-1, -1], dtype=np.int32)
-            black_kinglike = np.array(self.black_kinglike_pos if self.black_kinglike_pos else [-1, -1], dtype=np.int32)
-            current_player_int = Player.WHITE.value if self.current_player == Player.WHITE else Player.BLACK.value
-            
-            moves_array = _get_valid_moves_numba(
-                self.board, current_player_int, white_king, white_kinglike,
-                black_king, black_kinglike, self.game_over
-            )
-            # Convert numpy array to list of tuples
-            return [tuple(move) for move in moves_array]
-        
         # Fallback to original implementation
         if self.game_over:
             return []
@@ -714,20 +688,7 @@ class KingCapture:
         Action space: 2 pieces * BOARD_SIZE * BOARD_SIZE = 2 * 25 = 50 actions
         Format: [piece0_actions, piece1_actions] flattened
         """
-        if NUMBA_AVAILABLE:
-            # Convert positions to arrays (None -> [-1, -1])
-            white_king = np.array(self.white_king_pos if self.white_king_pos else [-1, -1], dtype=np.int32)
-            white_kinglike = np.array(self.white_kinglike_pos if self.white_kinglike_pos else [-1, -1], dtype=np.int32)
-            black_king = np.array(self.black_king_pos if self.black_king_pos else [-1, -1], dtype=np.int32)
-            black_kinglike = np.array(self.black_kinglike_pos if self.black_kinglike_pos else [-1, -1], dtype=np.int32)
-            current_player_int = Player.WHITE.value if self.current_player == Player.WHITE else Player.BLACK.value
-            
-            mask = _get_action_mask_numba(
-                self.board, current_player_int, white_king, white_kinglike,
-                black_king, black_kinglike, self.game_over
-            )
-            return mask
-        
+
         # Fallback to original implementation
         mask = np.zeros(2 * self.BOARD_SIZE * self.BOARD_SIZE, dtype=bool)
         valid_moves = self.get_valid_moves()

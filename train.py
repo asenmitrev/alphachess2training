@@ -41,6 +41,7 @@ def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int,
     games = [KingCapture() for _ in range(num_games)]
     game_histories = [[] for _ in range(num_games)]
     active_indices = list(range(num_games))
+    games_completed = 0  # Track sequential count of completed games
     
     # Loop until all games are finished
     while active_indices:
@@ -105,10 +106,11 @@ def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int,
                     result = 0.0
                 
                 # Log game completion
+                games_completed += 1
                 num_moves = len(game.move_history)
                 winner = game.winner.name if game.winner else "Draw"
                 remaining_games = len(active_indices) - len(finished_indices)
-                logging.info(f"Game {game_idx + 1}/{num_games} finished: {winner} won after {num_moves} moves ({remaining_games} games remaining)")
+                logging.info(f"Game {games_completed}/{num_games} finished: {winner} won after {num_moves} moves ({remaining_games} games remaining)")
                 
                 # Store examples
                 for i, (hist_state, hist_policy) in enumerate(game_histories[game_idx]):
@@ -194,8 +196,7 @@ def worker_self_play_queue(rank: int, model_state: Dict, config: Dict, work_queu
                 remaining = work_queue.qsize()
                 winner = game_info['winner']
                 num_moves = game_info['num_moves']
-                if games_processed % 20 == 0:
-                    logging.info(f"Worker {rank}: Game {game_id + 1} complete - {winner} won after {num_moves} moves ({remaining} games remaining in queue)")
+                logging.info(f"Worker {rank}: Completed {games_processed} games (game ID {game_id + 1}) - {winner} won after {num_moves} moves ({remaining} games remaining in queue)")
             except Exception as e:
                 logging.error(f"Worker {rank} error processing game {game_id}: {e}", exc_info=True)
             finally:
@@ -235,7 +236,6 @@ def _run_single_game(model: AlphaZeroNet, mcts: MCTS, num_simulations: int,
             game.winner = None  # Draw
             max_moves_reached = True
             break
-        
         # MCTS search for this game state
         policy = mcts.search(game)
         
@@ -252,7 +252,6 @@ def _run_single_game(model: AlphaZeroNet, mcts: MCTS, num_simulations: int,
         else:
             # Greedy
             action = valid_actions[np.argmax(policy[valid_actions])]
-        
         # Store history
         state = game.get_canonical_state()
         
@@ -260,7 +259,6 @@ def _run_single_game(model: AlphaZeroNet, mcts: MCTS, num_simulations: int,
         store_policy = policy
         if game.current_player == Player.BLACK:
             store_policy = game.flip_policy(policy)
-        
         game_history.append((state, store_policy))
         
         # Apply move

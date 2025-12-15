@@ -28,7 +28,7 @@ class Config:
     learning_rate: float = 0.001
     weight_decay: float = 1e-4  # L2 regularization to prevent overfitting
     temperature: float = 1.5  # Increased temperature for more exploration during self-play
-    num_workers: int = 8 # Parallel workers for game generation
+    num_workers: int = 8 # reallel workers for game generation
     
     # Replay buffer settings
     buffer_size: int = 500000  # Larger buffer
