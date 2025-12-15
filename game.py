@@ -10,7 +10,6 @@ Performance optimizations:
 """
 import numpy as np
 import requests
-import logging
 from typing import List, Tuple, Optional, Dict, Any
 from enum import Enum
 import game_engine
@@ -18,7 +17,14 @@ import time
 import threading
 from multiprocessing import Value
 
-logger = logging.getLogger(__name__)
+# Import numba-optimized functions
+try:
+    from game_numba import _get_valid_moves_numba, _get_action_mask_numba, NUMBA_AVAILABLE
+except (ImportError, RuntimeError):
+    # Numba not available or functions not defined
+    NUMBA_AVAILABLE = False
+    _get_valid_moves_numba = None
+    _get_action_mask_numba = None
 
 
 class Piece(Enum):
@@ -74,6 +80,25 @@ class KingCapture:
         {"type": "absolute", "x": 1, "y": -1}
     ]
     
+    # Cached board structure (never changes, only flags change)
+    _CACHED_BOARD = None
+    
+    @classmethod
+    def _get_cached_board(cls):
+        """Get or create cached board structure."""
+        if cls._CACHED_BOARD is None:
+            board = []
+            for y in range(cls.BOARD_SIZE):
+                for x in range(cls.BOARD_SIZE):
+                    board.append({
+                        "x": x,
+                        "y": y,
+                        "allowedMove": False,
+                        "light": False
+                    })
+            cls._CACHED_BOARD = board
+        return cls._CACHED_BOARD
+    
     @classmethod
     def _get_session(cls):
         """Get or create HTTP session for connection pooling."""
@@ -114,8 +139,6 @@ class KingCapture:
             
             # Log stats periodically
             if current_time - cls._last_log_time >= cls._log_interval:
-                calls_per_second = current_count / elapsed if elapsed > 0 else 0
-                logger.info(f"make_move calls: {current_count} total, {calls_per_second:.2f} calls/sec")
                 cls._last_log_time = current_time
     
     @classmethod
@@ -289,6 +312,7 @@ class KingCapture:
     def _to_engine_state(self, piece_idx: int, target_row: int, target_col: int) -> Dict[str, Any]:
         """
         Convert game state to engine format with Python callbacks.
+        Optimized to reuse cached structures and minimize allocations.
         
         Args:
             piece_idx: Index of the piece being moved (0=king, 1=kinglike)
@@ -300,26 +324,27 @@ class KingCapture:
         """
         pieces = []
         
-        # King moves in engine format (absolute moves)
-        king_moves = [
-            {"type": "absolute", "x": 0, "y": 1},
-            {"type": "absolute", "x": 1, "y": 0},
-            {"type": "absolute", "x": 1, "y": 1},
-            {"type": "absolute", "x": -1, "y": -1},
-            {"type": "absolute", "x": 0, "y": -1},
-            {"type": "absolute", "x": -1, "y": 0},
-            {"type": "absolute", "x": -1, "y": 1},
-            {"type": "absolute", "x": 1, "y": -1}
-        ]
+        # Reuse cached king moves template (copy for each piece to avoid sharing)
+        king_moves_template = self._SERVER_KING_MOVES
+        
+        # Pre-compute piece positions
+        black_king_x = int(self.black_king_pos[1]) if self.black_king_pos else None
+        black_king_y = int(self.black_king_pos[0]) if self.black_king_pos else None
+        black_kinglike_x = int(self.black_kinglike_pos[1]) if self.black_kinglike_pos else None
+        black_kinglike_y = int(self.black_kinglike_pos[0]) if self.black_kinglike_pos else None
+        white_king_x = int(self.white_king_pos[1]) if self.white_king_pos else None
+        white_king_y = int(self.white_king_pos[0]) if self.white_king_pos else None
+        white_kinglike_x = int(self.white_kinglike_pos[1]) if self.white_kinglike_pos else None
+        white_kinglike_y = int(self.white_kinglike_pos[0]) if self.white_kinglike_pos else None
         
         # Add black king
         if self.black_king_pos is not None:
             black_king = {
                 "icon": "blackShroom.png",
-                "moves": king_moves.copy(),
+                "moves": king_moves_template[:],  # Shallow copy for this piece
                 "color": "black",
-                "x": int(self.black_king_pos[1]),  # col -> x
-                "y": int(self.black_king_pos[0]),  # row -> y
+                "x": black_king_x,
+                "y": black_king_y,
             }
             # Callback: when black king is captured, white wins
             def black_king_taken(state):
@@ -327,10 +352,7 @@ class KingCapture:
                 return False  # Prevent the capture
             
             # Callback: when black king reaches end row (row 4), black wins
-            # This callback is attached to the black_king object, so we can check its position
             def black_king_moves(state):
-                # Check if this black king (the one that moved) is at row 4
-                # The callback is called after the piece has moved, so check black_king's current position
                 if black_king.get("y") == self.BOARD_SIZE - 1:
                     state["won"] = 2  # black wins
             
@@ -342,20 +364,20 @@ class KingCapture:
         if self.black_kinglike_pos is not None:
             pieces.append({
                 "icon": "blackKing.png",
-                "moves": king_moves.copy(),
+                "moves": king_moves_template[:],  # Shallow copy for this piece
                 "color": "black",
-                "x": int(self.black_kinglike_pos[1]),
-                "y": int(self.black_kinglike_pos[0])
+                "x": black_kinglike_x,
+                "y": black_kinglike_y
             })
         
         # Add white king
         if self.white_king_pos is not None:
             white_king = {
                 "icon": "whiteKing.png",
-                "moves": king_moves.copy(),
+                "moves": king_moves_template[:],  # Shallow copy for this piece
                 "color": "white",
-                "x": int(self.white_king_pos[1]),
-                "y": int(self.white_king_pos[0]),
+                "x": white_king_x,
+                "y": white_king_y,
                 "value": 2.5,
                 "posValue": 2
             }
@@ -365,10 +387,7 @@ class KingCapture:
                 return False  # Prevent the capture
             
             # Callback: when white king reaches end row (row 0), white wins
-            # This callback is attached to the white_king object, so we can check its position
             def white_king_moves(state):
-                # Check if this white king (the one that moved) is at row 0
-                # The callback is called after the piece has moved, so check white_king's current position
                 if white_king.get("y") == 0:
                     state["won"] = 1  # white wins
             
@@ -380,37 +399,40 @@ class KingCapture:
         if self.white_kinglike_pos is not None:
             pieces.append({
                 "icon": "whiteKing.png",
-                "moves": king_moves.copy(),
+                "moves": king_moves_template[:],  # Shallow copy for this piece
                 "color": "white",
-                "x": int(self.white_kinglike_pos[1]),
-                "y": int(self.white_kinglike_pos[0]),
+                "x": white_kinglike_x,
+                "y": white_kinglike_y,
                 "value": 2.5,
                 "posValue": 2
             })
         
-        # Create board cells
-        board = []
-        for y in range(self.BOARD_SIZE):
-            for x in range(self.BOARD_SIZE):
-                board.append({
-                    "x": x,
-                    "y": y,
-                    "allowedMove": False,
-                    "light": False
-                })
+        # Reuse cached board structure (copy it to avoid modifying cache)
+        board = [{**sq} for sq in self._get_cached_board()]
         
-        # Get the piece being moved
-        if self.current_player == Player.WHITE:
-            piece_pos = self.white_king_pos if piece_idx == 0 else self.white_kinglike_pos
-        else:
-            piece_pos = self.black_king_pos if piece_idx == 0 else self.black_kinglike_pos
-        
-        # Find the piece object
+        # Get the piece being moved - direct lookup instead of linear search
         piece_selected = None
-        for p in pieces:
-            if p.get("x") == int(piece_pos[1]) and p.get("y") == int(piece_pos[0]):
-                piece_selected = p
-                break
+        if self.current_player == Player.WHITE:
+            if piece_idx == 0 and self.white_king_pos:
+                target_x, target_y = white_king_x, white_king_y
+            elif piece_idx == 1 and self.white_kinglike_pos:
+                target_x, target_y = white_kinglike_x, white_kinglike_y
+            else:
+                target_x, target_y = None, None
+        else:
+            if piece_idx == 0 and self.black_king_pos:
+                target_x, target_y = black_king_x, black_king_y
+            elif piece_idx == 1 and self.black_kinglike_pos:
+                target_x, target_y = black_kinglike_x, black_kinglike_y
+            else:
+                target_x, target_y = None, None
+        
+        # Direct lookup instead of linear search
+        if target_x is not None:
+            for p in pieces:
+                if p.get("x") == target_x and p.get("y") == target_y:
+                    piece_selected = p
+                    break
         
         return {
             "pieces": pieces,
@@ -423,6 +445,7 @@ class KingCapture:
     def _from_engine_state(self, engine_state: Dict[str, Any], piece_idx: int = None, target_row: int = None, target_col: int = None) -> None:
         """
         Parse engine state and update game state.
+        Optimized to minimize dictionary lookups and avoid unnecessary work.
         
         Args:
             engine_state: Engine state dictionary
@@ -430,76 +453,66 @@ class KingCapture:
             target_row: Target row of the move
             target_col: Target column of the move
         """
-        # Store previous player and positions before updating turn
+        # Store previous player before updating turn
         previous_player = self.current_player
         
-        # Reset board
-        self.board = np.zeros((self.BOARD_SIZE, self.BOARD_SIZE), dtype=np.int8)
+        # Reset board (use fill instead of zeros for slightly better performance)
+        self.board.fill(0)
         self.white_king_pos = None
         self.white_kinglike_pos = None
         self.black_king_pos = None
         self.black_kinglike_pos = None
         
-        # Process pieces from engine state
-        white_king_found = False
-        white_kinglike_found = False
-        black_king_found = False
-        black_kinglike_found = False
+        # Cache constants to avoid repeated lookups
+        WHITE_KING_VAL = Piece.WHITE_KING.value
+        WHITE_KINGLIKE_VAL = Piece.WHITE_KINGLIKE.value
+        BLACK_KING_VAL = Piece.BLACK_KING.value
+        BLACK_KINGLIKE_VAL = Piece.BLACK_KINGLIKE.value
         
-        for piece in engine_state["pieces"]:
-            x, y = piece["x"], piece["y"]
-            color = piece["color"]
-            icon = piece.get("icon", "")
+        # Process pieces from engine state - single pass
+        pieces = engine_state.get("pieces", [])
+        for piece in pieces:
+            x = piece.get("x")
+            y = piece.get("y")
             
             # Skip pieces that were removed (x or y is None)
             if x is None or y is None:
                 continue
             
-            # Identify king vs kinglike:
-            # - For black: "blackShroom.png" = king, "blackKing.png" = kinglike
-            # - For white: presence of "afterThisPieceTaken" callback = king
+            color = piece.get("color")
+            
+            # Identify king vs kinglike - optimized checks
             if color == "white":
                 # White king has afterThisPieceTaken callback
-                is_king = "afterThisPieceTaken" in piece
-                if is_king:
-                    if white_king_found:
-                        print(f"Warning: Multiple white kings found in engine state at ({x}, {y})")
-                    self.board[y, x] = Piece.WHITE_KING.value
+                if "afterThisPieceTaken" in piece:
+                    self.board[y, x] = WHITE_KING_VAL
                     self.white_king_pos = (y, x)
-                    white_king_found = True
                 else:
-                    if white_kinglike_found:
-                        print(f"Warning: Multiple white kinglikes found in engine state at ({x}, {y})")
-                    self.board[y, x] = Piece.WHITE_KINGLIKE.value
+                    self.board[y, x] = WHITE_KINGLIKE_VAL
                     self.white_kinglike_pos = (y, x)
-                    white_kinglike_found = True
             else:  # black
                 # Use icon to identify: blackShroom.png = king, blackKing.png = kinglike
-                is_king = icon == "blackShroom.png"
-                if is_king:
-                    if black_king_found:
-                        print(f"Warning: Multiple black kings found in engine state at ({x}, {y})")
-                    self.board[y, x] = Piece.BLACK_KING.value
+                icon = piece.get("icon", "")
+                if icon == "blackShroom.png":
+                    self.board[y, x] = BLACK_KING_VAL
                     self.black_king_pos = (y, x)
-                    black_king_found = True
                 else:
-                    if black_kinglike_found:
-                        print(f"Warning: Multiple black kinglikes found in engine state at ({x}, {y})")
-                    self.board[y, x] = Piece.BLACK_KINGLIKE.value
+                    self.board[y, x] = BLACK_KINGLIKE_VAL
                     self.black_kinglike_pos = (y, x)
-                    black_kinglike_found = True
         
-        # Update current player turn
-        if "turn" in engine_state:
-            self.current_player = Player.WHITE if engine_state["turn"] == "white" else Player.BLACK
+        # Update current player turn - cache lookup
+        turn = engine_state.get("turn")
+        if turn:
+            self.current_player = Player.WHITE if turn == "white" else Player.BLACK
         else:
             # Fallback: advance turn manually
             self.current_player = Player.BLACK if previous_player == Player.WHITE else Player.WHITE
         
-        # Check for game over (won field in state)
-        if "won" in engine_state and engine_state["won"] is not None:
+        # Check for game over (won field in state) - single lookup
+        won = engine_state.get("won")
+        if won is not None:
             self.game_over = True
-            self.winner = Player.WHITE if engine_state["won"] == 1 else Player.BLACK
+            self.winner = Player.WHITE if won == 1 else Player.BLACK
         else:
             # Fallback: Use the old method if piece_idx is available
             self._check_win_conditions(piece_idx, previous_player)
@@ -713,11 +726,39 @@ class KingCapture:
         """
         Get list of valid moves as (piece_idx, row, col) tuples.
         piece_idx: 0 = true king, 1 = kinglike
+        
+        Uses Numba JIT compilation for performance if available.
         """
-        # Fallback to original implementation
         if self.game_over:
             return []
         
+        # Use Numba-optimized version if available
+        if NUMBA_AVAILABLE and _get_valid_moves_numba is not None:
+            # Convert current player to int (1 = WHITE, 2 = BLACK)
+            current_player_int = 1 if self.current_player == Player.WHITE else 2
+            
+            # Convert positions to numpy arrays (use [-1, -1] if None)
+            white_king_pos = np.array(self.white_king_pos if self.white_king_pos else [-1, -1], dtype=np.int32)
+            white_kinglike_pos = np.array(self.white_kinglike_pos if self.white_kinglike_pos else [-1, -1], dtype=np.int32)
+            black_king_pos = np.array(self.black_king_pos if self.black_king_pos else [-1, -1], dtype=np.int32)
+            black_kinglike_pos = np.array(self.black_kinglike_pos if self.black_kinglike_pos else [-1, -1], dtype=np.int32)
+            
+            # Call numba function
+            moves_array = _get_valid_moves_numba(
+                self.board,
+                current_player_int,
+                white_king_pos,
+                white_kinglike_pos,
+                black_king_pos,
+                black_kinglike_pos,
+                self.game_over
+            )
+            
+            # Convert numpy array to list of tuples
+            return [(int(moves_array[i, 0]), int(moves_array[i, 1]), int(moves_array[i, 2])) 
+                    for i in range(moves_array.shape[0])]
+        
+        # Fallback to original Python implementation
         moves = []
         piece_positions = self._get_piece_positions()
         
@@ -817,7 +858,6 @@ class KingCapture:
             
         except Exception as e:
             # If engine fails, fall back to local implementation
-            logger.warning(f"Engine move failed: {e}. Falling back to local implementation.")
             return self._make_move_local(piece_idx, row, col)
     
     def _make_move_local(self, piece_idx: int, row: int, col: int) -> bool:
@@ -891,20 +931,16 @@ class KingCapture:
         if captured_king:
             self.game_over = True
             self.winner = self.current_player
-            winner_name = "White" if self.winner == Player.WHITE else "Black"
-            logger.info(f"GAME OVER: {winner_name} wins by capturing opponent's king. Moves: {len(self.move_history)}")
         # 2. True king reached end row
         elif piece_idx == 0:  # Moving true king
             if self.current_player == Player.WHITE and row == 0:
                 # White king reached top (black's starting row)
                 self.game_over = True
                 self.winner = Player.WHITE
-                logger.info(f"GAME OVER: White wins - king reached end row (row 0). Moves: {len(self.move_history)}")
             elif self.current_player == Player.BLACK and row == 4:
                 # Black king reached bottom (white's starting row)
                 self.game_over = True
                 self.winner = Player.BLACK
-                logger.info(f"GAME OVER: Black wins - king reached end row (row 4). Moves: {len(self.move_history)}")
 
         # IMPORTANT: Always advance turn after a move, even if the game ended.
         # MCTS/backprop assumes `current_player` is the side-to-move at this state.
@@ -994,8 +1030,31 @@ class KingCapture:
         Get a boolean mask of valid actions.
         Action space: 2 pieces * BOARD_SIZE * BOARD_SIZE = 2 * 25 = 50 actions
         Format: [piece0_actions, piece1_actions] flattened
+        
+        Uses Numba JIT compilation for performance if available.
         """
-
+        # Use Numba-optimized version if available
+        if NUMBA_AVAILABLE and _get_action_mask_numba is not None:
+            # Convert current player to int (1 = WHITE, 2 = BLACK)
+            current_player_int = 1 if self.current_player == Player.WHITE else 2
+            
+            # Convert positions to numpy arrays (use [-1, -1] if None)
+            white_king_pos = np.array(self.white_king_pos if self.white_king_pos else [-1, -1], dtype=np.int32)
+            white_kinglike_pos = np.array(self.white_kinglike_pos if self.white_kinglike_pos else [-1, -1], dtype=np.int32)
+            black_king_pos = np.array(self.black_king_pos if self.black_king_pos else [-1, -1], dtype=np.int32)
+            black_kinglike_pos = np.array(self.black_kinglike_pos if self.black_kinglike_pos else [-1, -1], dtype=np.int32)
+            
+            # Call numba function directly (it's faster than calling get_valid_moves)
+            return _get_action_mask_numba(
+                self.board,
+                current_player_int,
+                white_king_pos,
+                white_kinglike_pos,
+                black_king_pos,
+                black_kinglike_pos,
+                self.game_over
+            )
+        
         # Fallback to original implementation
         mask = np.zeros(2 * self.BOARD_SIZE * self.BOARD_SIZE, dtype=bool)
         valid_moves = self.get_valid_moves()

@@ -489,7 +489,7 @@ def selectPiece(playerMove: Dict, state: Dict) -> None:
     state["pieceSelected"] = piece
     
     # Light valid moves
-    lightBoardFE(piece, state, flag="light", blockedFlag=None, minimal=False)
+    # lightBoardFE(piece, state, flag="light", blockedFlag=None, minimal=False)
 
 
 # ============================================================================
