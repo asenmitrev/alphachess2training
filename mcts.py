@@ -108,7 +108,7 @@ class MCTS:
     """Monte Carlo Tree Search for AlphaZero."""
     
     def __init__(self, model: torch.nn.Module, num_simulations: int = 100, c_puct: float = 1.0, 
-                 device: str = 'cpu', batch_size: int = 32):
+                 device: str = 'cpu', batch_size: int = 128):
         """
         Initialize MCTS.
         
