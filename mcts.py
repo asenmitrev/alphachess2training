@@ -108,7 +108,7 @@ class MCTS:
     """Monte Carlo Tree Search for AlphaZero."""
     
     def __init__(self, model: torch.nn.Module, num_simulations: int = 100, c_puct: float = 1.0, 
-                 device: str = 'cpu'):
+                 device: str = 'cpu', batch_size: int = 32):
         """
         Initialize MCTS.
         
@@ -117,11 +117,13 @@ class MCTS:
             num_simulations: Number of MCTS simulations per move
             c_puct: Exploration constant
             device: Device to run model on
+            batch_size: Number of leaf nodes to batch together for GPU evaluation
         """
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.device = device
+        self.batch_size = batch_size
         self.model.eval()
     
     def search(self, game: KingCapture) -> np.ndarray:
@@ -153,7 +155,10 @@ class MCTS:
         
         root.expand(policy)
         
-        # Sequential MCTS simulations
+        # Buffer to collect leaf nodes for batch evaluation
+        leaf_nodes_buffer = []
+        
+        # MCTS simulations with batched evaluation
         for sim in range(self.num_simulations):
             node = root
             
@@ -167,8 +172,13 @@ class MCTS:
                 value = result if result is not None else 0.0
                 node.backpropagate(value)
             else:
-                # Evaluate and expand this leaf node
-                self._evaluate(node)
+                # Add to buffer instead of evaluating immediately
+                leaf_nodes_buffer.append(node)
+                
+                # When buffer reaches batch_size OR at end of simulations, batch evaluate
+                if len(leaf_nodes_buffer) >= self.batch_size or sim == self.num_simulations - 1:
+                    self._evaluate_batch(leaf_nodes_buffer)
+                    leaf_nodes_buffer.clear()
         
         # Extract visit counts as policy
         action_size = 2 * game.BOARD_SIZE * game.BOARD_SIZE
@@ -199,33 +209,60 @@ class MCTS:
         """
         return [self.search(game) for game in games]
     
+    def _evaluate_batch(self, nodes: List[Node]):
+        """
+        Evaluate multiple nodes in a single batched CUDA call.
+        
+        Args:
+            nodes: List of nodes to evaluate
+        """
+        if len(nodes) == 0:
+            return
+        
+        # Convert all game states to tensors and batch them
+        batch_tensors = []
+        for node in nodes:
+            tensor = self._game_to_tensor(node.game)
+            batch_tensors.append(tensor)
+        
+        # Stack into single batched tensor: [batch_size, 1, board_size, board_size]
+        batched_tensor = torch.cat(batch_tensors, dim=0)
+        
+        # Single batched CUDA call for all nodes
+        with torch.no_grad():
+            policy_logits, values = self.model(batched_tensor)
+            # policy_logits: [batch_size, action_size]
+            # values: [batch_size]
+            
+            policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
+            values_np = values.cpu().numpy()
+        
+        # Process each node with its corresponding results
+        for i, node in enumerate(nodes):
+            policy = policies[i]
+            value = float(values_np[i])
+            
+            # Flip policy if Black
+            if node.game.current_player == Player.BLACK:
+                policy = node.game.flip_policy(policy)
+            
+            # Mask invalid actions
+            action_mask = node.game.get_action_mask()
+            policy = policy * action_mask
+            policy = policy / (policy.sum() + 1e-8)
+            
+            node.expand(policy)
+            node.backpropagate(value)
+    
     def _evaluate(self, node: Node):
         """
         Evaluate a single node using the neural network.
+        (Kept for backward compatibility, but now uses batch with size 1)
         
         Args:
             node: Node to evaluate
         """
-        # Convert to tensor
-        tensor = self._game_to_tensor(node.game)
-        
-        # Evaluate
-        with torch.no_grad():
-            policy_logits, values = self.model(tensor)
-            policy = torch.softmax(policy_logits, dim=1).cpu().numpy()[0]
-            value = values.item()
-        
-        # Flip policy if Black
-        if node.game.current_player == Player.BLACK:
-            policy = node.game.flip_policy(policy)
-        
-        # Mask invalid actions
-        action_mask = node.game.get_action_mask()
-        policy = policy * action_mask
-        policy = policy / (policy.sum() + 1e-8)
-        
-        node.expand(policy)
-        node.backpropagate(value)
+        self._evaluate_batch([node])
     
     def _game_to_tensor(self, game: KingCapture) -> torch.Tensor:
         """Convert game state to tensor for neural network."""
