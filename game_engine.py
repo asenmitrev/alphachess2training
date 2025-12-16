@@ -667,6 +667,9 @@ def playerMove(
         if callable(callback):
             callback(state)
     
+    # Change turn to the other player
+    changeTurn(state)
+    
     return True
 
 
