@@ -30,6 +30,7 @@ class Config:
     temperature: float = 1.5  # Increased temperature for more exploration during self-play
     num_workers: int = 8  # Parallel workers for game generation
     worker_batch_size: int = 8  # Games per worker batch (for cross-tree MCTS batching)
+    threads_per_worker: int = 1  # PyTorch threads per worker (for tensor ops)
     
     # Replay buffer settings
     buffer_size: int = 500000  # Larger buffer

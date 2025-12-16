@@ -149,6 +149,10 @@ def worker_self_play_queue(rank: int, model_state: Dict, config: Dict, work_queu
         level=logging.INFO
     )
     
+    # Set PyTorch threads for this worker (for CPU tensor operations)
+    threads_per_worker = config.get('threads_per_worker', 1)
+    torch.set_num_threads(threads_per_worker)
+    
     # Set random seed for this worker to ensure diversity
     seed = int(time.time()) + rank
     torch.manual_seed(seed)
@@ -404,7 +408,8 @@ class AlphaZeroTrainer:
         device: str = 'cpu',
         save_dir: str = 'checkpoints',
         num_workers: int = 0,
-        worker_batch_size: int = 4
+        worker_batch_size: int = 4,
+        threads_per_worker: int = 1
     ):
         """
         Initialize trainer.
@@ -423,6 +428,7 @@ class AlphaZeroTrainer:
             save_dir: Directory to save checkpoints
             num_workers: Number of parallel workers for self-play
             worker_batch_size: Number of games each worker processes simultaneously with BatchedMCTS
+            threads_per_worker: PyTorch threads per worker for tensor operations
         """
         self.model = model.to(device)
         self.num_simulations = num_simulations
@@ -437,6 +443,7 @@ class AlphaZeroTrainer:
         self.num_workers = num_workers if num_workers > 0 else 1
         self.max_game_length = 400  # Default, can be overridden
         self.worker_batch_size = worker_batch_size
+        self.threads_per_worker = threads_per_worker
         
         # Create save directory
         os.makedirs(save_dir, exist_ok=True)
@@ -516,7 +523,8 @@ class AlphaZeroTrainer:
                 'temperature': self.temperature,
                 'device': self.device,
                 'max_game_length': getattr(self, 'max_game_length', 400),
-                'worker_batch_size': getattr(self, 'worker_batch_size', 4)
+                'worker_batch_size': getattr(self, 'worker_batch_size', 4),
+                'threads_per_worker': getattr(self, 'threads_per_worker', 1)
             }
             
             # Get current model state

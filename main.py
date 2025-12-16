@@ -42,6 +42,7 @@ def main():
         num_epochs=config.num_epochs,
         num_workers=config.num_workers,
         worker_batch_size=config.worker_batch_size,
+        threads_per_worker=config.threads_per_worker,
         batch_size=config.batch_size,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
