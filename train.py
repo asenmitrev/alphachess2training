@@ -11,7 +11,7 @@ import random
 from typing import List, Tuple, Dict, Any
 from game import KingCapture, Player
 from model import AlphaZeroNet
-from mcts import MCTS
+from mcts import MCTS, BatchedMCTS
 import os
 import time
 import logging
@@ -29,11 +29,14 @@ def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int,
                      c_puct: float, temperature: float, device: str,
                      max_game_length: int = 400) -> List[Tuple]:
     """
-    Run a batch of games using sequential MCTS.
+    Run a batch of games using batched MCTS with cross-tree leaf evaluation batching.
     This function is used by both the main process and worker processes.
+    
+    The BatchedMCTS batches neural network evaluations across all game trees,
+    making efficient use of GPU parallelism.
     """
-    # Initialize MCTS
-    mcts = MCTS(model, num_simulations, c_puct, device)
+    # Initialize BatchedMCTS for efficient cross-tree batching
+    mcts = BatchedMCTS(model, num_simulations, c_puct, device)
     
     examples = []
     
@@ -48,7 +51,7 @@ def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int,
         # Get current states for active games
         current_games = [games[i] for i in active_indices]
         
-        # Batched MCTS search - parallelized across all games
+        # Batched MCTS search - leaf evaluations batched across all trees
         policies = mcts.search_batch(current_games)
         
         # Make moves for all active games
@@ -137,7 +140,8 @@ def run_batched_games(model: AlphaZeroNet, num_games: int, num_simulations: int,
 def worker_self_play_queue(rank: int, model_state: Dict, config: Dict, work_queue: mp.Queue, result_queue: mp.Queue):
     """
     Worker function for parallel self-play with work-stealing queue.
-    Workers pull games from the shared queue until it's empty.
+    Workers pull batches of games from the shared queue and process them with BatchedMCTS
+    for efficient cross-tree leaf evaluation batching.
     """
     # Configure logging for worker process
     logging.basicConfig(
@@ -162,46 +166,56 @@ def worker_self_play_queue(rank: int, model_state: Dict, config: Dict, work_queu
     model.to(device)
     model.eval()
     
-    # Initialize MCTS
-    mcts = MCTS(model, config['num_simulations'], config['c_puct'], device)
+    # Batch size for this worker - how many games to run simultaneously
+    worker_batch_size = config.get('worker_batch_size', 4)
     
     all_examples = []
     games_processed = 0
     
-    # Pull games from queue until empty
+    # Pull batches of games from queue until empty
     while True:
         try:
-            # Try to get a game from the queue (non-blocking with timeout)
-            try:
-                game_id = work_queue.get(timeout=0.1)
-            except queue.Empty:
+            # Try to get a batch of games from the queue
+            game_ids = []
+            for _ in range(worker_batch_size):
+                try:
+                    game_id = work_queue.get(timeout=0.1)
+                    game_ids.append(game_id)
+                except queue.Empty:
+                    break
+            
+            if not game_ids:
                 # Queue is empty, we're done
                 break
             
-            # Process this single game
+            # Process this batch of games using BatchedMCTS
             try:
-                examples, game_info = _run_single_game(
+                batch_size = len(game_ids)
+                examples = run_batched_games(
                     model=model,
-                    mcts=mcts,
+                    num_games=batch_size,
                     num_simulations=config['num_simulations'],
                     c_puct=config['c_puct'],
                     temperature=config['temperature'],
+                    device=device,
                     max_game_length=config.get('max_game_length', 400)
                 )
                 
                 all_examples.extend(examples)
-                games_processed += 1
+                games_processed += batch_size
                 
-                # Log game completion
+                # Log batch completion
                 remaining = work_queue.qsize()
-                winner = game_info['winner']
-                num_moves = game_info['num_moves']
-                logging.info(f"Worker {rank}: Completed {games_processed} games (game ID {game_id + 1}) - {winner} won after {num_moves} moves ({remaining} games remaining in queue)")
+                logging.info(f"Worker {rank}: Completed batch of {batch_size} games (total: {games_processed}) ({remaining} games remaining in queue)")
             except Exception as e:
-                logging.error(f"Worker {rank} error processing game {game_id}: {e}", exc_info=True)
+                logging.error(f"Worker {rank} error processing batch {game_ids}: {e}", exc_info=True)
             finally:
-                # Mark task as done even if processing failed
-                work_queue.task_done()
+                # Mark all tasks as done
+                for _ in game_ids:
+                    try:
+                        work_queue.task_done()
+                    except ValueError:
+                        pass  # task_done called too many times
             
         except KeyboardInterrupt:
             logging.info(f"Worker {rank} interrupted")
@@ -389,7 +403,8 @@ class AlphaZeroTrainer:
         temperature: float = 1.0,
         device: str = 'cpu',
         save_dir: str = 'checkpoints',
-        num_workers: int = 0
+        num_workers: int = 0,
+        worker_batch_size: int = 4
     ):
         """
         Initialize trainer.
@@ -407,6 +422,7 @@ class AlphaZeroTrainer:
             device: Device to run on
             save_dir: Directory to save checkpoints
             num_workers: Number of parallel workers for self-play
+            worker_batch_size: Number of games each worker processes simultaneously with BatchedMCTS
         """
         self.model = model.to(device)
         self.num_simulations = num_simulations
@@ -420,6 +436,7 @@ class AlphaZeroTrainer:
         self.save_dir = save_dir
         self.num_workers = num_workers if num_workers > 0 else 1
         self.max_game_length = 400  # Default, can be overridden
+        self.worker_batch_size = worker_batch_size
         
         # Create save directory
         os.makedirs(save_dir, exist_ok=True)
@@ -498,7 +515,8 @@ class AlphaZeroTrainer:
                 'c_puct': self.c_puct,
                 'temperature': self.temperature,
                 'device': self.device,
-                'max_game_length': getattr(self, 'max_game_length', 400)
+                'max_game_length': getattr(self, 'max_game_length', 400),
+                'worker_batch_size': getattr(self, 'worker_batch_size', 4)
             }
             
             # Get current model state

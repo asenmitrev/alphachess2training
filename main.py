@@ -41,6 +41,7 @@ def main():
         num_iterations=config.num_iterations,
         num_epochs=config.num_epochs,
         num_workers=config.num_workers,
+        worker_batch_size=config.worker_batch_size,
         batch_size=config.batch_size,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,

@@ -233,3 +233,202 @@ class MCTS:
         # Add batch and channel dimensions: (1, 1, board_size, board_size)
         tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
         return tensor.to(self.device)
+
+
+class BatchedMCTS:
+    """
+    Batched Monte Carlo Tree Search that batches leaf evaluations across multiple trees.
+    
+    Instead of batching within a single tree (which requires virtual loss and complex
+    synchronization), this implementation maintains multiple independent MCTS trees
+    (one per game) and batches the neural network evaluations of leaf nodes across trees.
+    
+    This approach:
+    - Makes efficient use of GPU batch processing
+    - Avoids virtual loss complexity
+    - Is simpler and more predictable than within-tree parallelization
+    """
+    
+    def __init__(self, model: torch.nn.Module, num_simulations: int = 100, c_puct: float = 1.0,
+                 device: str = 'cpu'):
+        """
+        Initialize BatchedMCTS.
+        
+        Args:
+            model: Neural network model
+            num_simulations: Number of MCTS simulations per move
+            c_puct: Exploration constant
+            device: Device to run model on
+        """
+        self.model = model
+        self.num_simulations = num_simulations
+        self.c_puct = c_puct
+        self.device = device
+        self.model.eval()
+    
+    def search_batch(self, games: List[KingCapture]) -> List[np.ndarray]:
+        """
+        Perform batched MCTS search on multiple games simultaneously.
+        
+        Leaf node evaluations are batched across all trees for efficient GPU utilization.
+        
+        Args:
+            games: List of game states to search
+            
+        Returns:
+            List of policy distributions, one per game
+        """
+        if not games:
+            return []
+        
+        num_trees = len(games)
+        
+        # Initialize roots for all trees
+        roots = [Node(game) for game in games]
+        
+        # Batch evaluate roots to get initial policies
+        root_states = []
+        for game in games:
+            state = game.get_canonical_state()
+            root_states.append(state)
+        
+        root_states_tensor = torch.FloatTensor(np.array(root_states)).unsqueeze(1).to(self.device)
+        
+        with torch.no_grad():
+            policy_logits, values = self.model(root_states_tensor)
+            policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
+        
+        # Expand all roots
+        for i, (root, game) in enumerate(zip(roots, games)):
+            policy = policies[i]
+            
+            # Flip policy if Black
+            if game.current_player == Player.BLACK:
+                policy = game.flip_policy(policy)
+            
+            # Mask and normalize
+            action_mask = game.get_action_mask()
+            policy = policy * action_mask
+            policy_sum = policy.sum()
+            if policy_sum > 0:
+                policy = policy / policy_sum
+            else:
+                policy = action_mask.astype(float)
+                policy = policy / (policy.sum() + 1e-8)
+            
+            root.expand(policy)
+        
+        # Run batched simulations
+        for _ in range(self.num_simulations):
+            # Selection phase: select leaf node for each tree
+            leaves = []
+            leaf_indices = []  # Track which trees have non-terminal leaves
+            
+            for tree_idx, root in enumerate(roots):
+                node = root
+                
+                # Selection: traverse to leaf
+                while node.is_expanded() and not node.game.game_over:
+                    node = node.select_child(self.c_puct)
+                
+                # Check if terminal
+                if node.game.game_over:
+                    # Terminal node: backpropagate immediately
+                    result = node.game.get_result(node.game.current_player)
+                    value = result if result is not None else 0.0
+                    node.backpropagate(value)
+                else:
+                    # Non-terminal leaf: add to batch
+                    leaves.append(node)
+                    leaf_indices.append(tree_idx)
+            
+            # Batch evaluate all non-terminal leaves
+            if leaves:
+                self._batch_evaluate(leaves)
+        
+        # Extract policies from all trees
+        policies_out = []
+        for root, game in zip(roots, games):
+            action_size = 2 * game.BOARD_SIZE * game.BOARD_SIZE
+            visit_counts = np.zeros(action_size)
+            
+            for action, child in root.children.items():
+                visit_counts[action] = child.visit_count
+            
+            # Normalize to get policy distribution
+            if visit_counts.sum() > 0:
+                policy = visit_counts / visit_counts.sum()
+            else:
+                # Fallback to uniform over valid moves
+                action_mask = game.get_action_mask()
+                policy = action_mask.astype(float)
+                policy = policy / (policy.sum() + 1e-8)
+            
+            policies_out.append(policy)
+        
+        return policies_out
+    
+    def _batch_evaluate(self, nodes: List[Node]):
+        """
+        Batch evaluate multiple leaf nodes using a single neural network forward pass.
+        
+        Args:
+            nodes: List of leaf nodes to evaluate
+        """
+        if not nodes:
+            return
+        
+        # Collect states for batch evaluation
+        states = []
+        for node in nodes:
+            state = node.game.get_canonical_state()
+            states.append(state)
+        
+        # Batch forward pass
+        states_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(self.device)
+        
+        with torch.no_grad():
+            policy_logits, values = self.model(states_tensor)
+            policies = torch.softmax(policy_logits, dim=1).cpu().numpy()
+            values_np = values.cpu().numpy().flatten()
+        
+        # Expand and backpropagate for each node
+        for i, node in enumerate(nodes):
+            policy = policies[i]
+            value = values_np[i]
+            
+            # Flip policy if Black
+            if node.game.current_player == Player.BLACK:
+                policy = node.game.flip_policy(policy)
+            
+            # Mask and normalize
+            action_mask = node.game.get_action_mask()
+            policy = policy * action_mask
+            policy_sum = policy.sum()
+            if policy_sum > 0:
+                policy = policy / policy_sum
+            else:
+                policy = action_mask.astype(float)
+                policy = policy / (policy.sum() + 1e-8)
+            
+            # Expand and backpropagate
+            node.expand(policy)
+            node.backpropagate(value)
+    
+    def search(self, game: KingCapture) -> np.ndarray:
+        """
+        Perform MCTS search on a single game (convenience method).
+        
+        Args:
+            game: Current game state
+            
+        Returns:
+            Policy distribution over actions
+        """
+        return self.search_batch([game])[0]
+    
+    def _game_to_tensor(self, game: KingCapture) -> torch.Tensor:
+        """Convert game state to tensor for neural network."""
+        state = game.get_canonical_state()
+        tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
+        return tensor.to(self.device)
